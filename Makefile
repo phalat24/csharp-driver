@@ -189,6 +189,10 @@ clean-rust:
 build-rust:
 	cd rust; \
 	cargo build; \
-	cd ../examples/RustWrapper/bin/Debug/net8/; \
+	cd ../examples/RustWrapper/bin/Debug/net9/; \
 	ln -f -s ../../../../../rust/target/debug/libcsharp_wrapper.so . || true
+
+.PHONY: run-wrapper-example
+run-wrapper-example:
+	dotnet run --project examples/RustWrapper/RustWrapper.csproj
 

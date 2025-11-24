@@ -53,6 +53,9 @@ jobs:
       - name: Build the project
         run: dotnet build src/Cassandra/Cassandra.csproj
 
+      - name: Symlink Rust lib
+        run: make create-rust-lib-symlinks
+
       - name: Run unit tests
         run: TARGET_FRAMEWORK=net9 make test-unit
 
@@ -125,6 +128,9 @@ jobs:
             echo "Unknown scylla version name `${{ matrix.scylla-version }}`"
             exit 1
           fi
+
+      - name: Symlink Rust lib
+        run: make create-rust-lib-symlinks
 
       - name: Run unit tests
         run: make test-unit

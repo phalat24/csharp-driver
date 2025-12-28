@@ -56,9 +56,21 @@ namespace Cassandra
 
         private static readonly unsafe delegate* unmanaged[Cdecl]<IntPtr, IntPtr, nuint, ushort, IntPtr, nuint, IntPtr, nuint, IntPtr, void> AddHostPtr = &AddHostCallback;
 
+        private class RefreshContext
+        {
+            public Dictionary<IPEndPoint, Host> NewHosts { get; }
+            public CopyOnWriteDictionary<IPEndPoint, Host> OldHosts { get; }
+
+            public RefreshContext(CopyOnWriteDictionary<IPEndPoint, Host> oldHosts)
+            {
+                OldHosts = oldHosts;
+                NewHosts = new Dictionary<IPEndPoint, Host>(oldHosts.Count);
+            }
+        }
+
         [UnmanagedCallersOnly(CallConvs = new Type[] { typeof(CallConvCdecl) })]
         private static unsafe void AddHostCallback(
-            IntPtr listPtr,
+            IntPtr contextPtr,
             IntPtr ipBytesPtr,
             nuint ipBytesLen,
             ushort port,
@@ -70,13 +82,13 @@ namespace Cassandra
         {
             try
             {
-                // Safety: 
-                // listPtr is a raw pointer to a List<Host> on the managed heap.
+                // Safety:
+                // contextPtr is a raw pointer to a RefreshContext on the managed heap.
                 // The GC could theoretically move it during this callback, but in practice:
                 // 1. cluster_state_fill_nodes calls this callback synchronously and completes quickly
-                // 2. The list is referenced in AllHosts() preventing collection (but not movement)
+                // 2. The context is referenced in AllHosts() preventing collection (but not movement)
                 // 3. This matches the pattern used in row_set_fill_columns_metadata
-                var list = Unsafe.Read<List<Host>>((void*)listPtr);
+                var context = Unsafe.Read<RefreshContext>((void*)contextPtr);
 
                 // Construct IPAddress directly from bytes (4 for IPv4, 16 for IPv6).
                 // ipBytes is a ReadOnlySpan over unmanaged memory (ipBytesPtr) that is only 
@@ -86,6 +98,13 @@ namespace Cassandra
                 var ipAddress = new IPAddress(ipBytes);
                 var address = new IPEndPoint(ipAddress, port);
 
+                // TODO: Consider changing the cache key to host id as it is meant to be the primary identifier of the hosts
+                if (context.OldHosts.TryGetValue(address, out var host))
+                {
+                    context.NewHosts[address] = host;
+                    return;
+                }
+
                 var datacenter = (datacenterPtr == IntPtr.Zero || datacenterLen == 0) ? null : Marshal.PtrToStringUTF8(datacenterPtr, (int)datacenterLen);
                 var rack = (rackPtr == IntPtr.Zero || rackLen == 0) ? null : Marshal.PtrToStringUTF8(rackPtr, (int)rackLen);
 
@@ -94,8 +113,8 @@ namespace Cassandra
                 var hostIdBytes = new ReadOnlySpan<byte>((void*)hostIdBytesPtr, 16);
                 var hostId = new Guid(hostIdBytes);
 
-                var host = new Host(address, hostId, datacenter, rack);
-                list.Add(host);
+                host = new Host(address, hostId, datacenter, rack);
+                context.NewHosts[address] = host;
             }
             catch (Exception ex)
             {
@@ -193,17 +212,17 @@ namespace Cassandra
                 }
 
                 // Otherwise we are forced to refill all hosts.
-                var hosts = new List<Host>();
+                var context = new RefreshContext(_cachedHosts);
                 unsafe
                 {
                     cluster_state_fill_nodes(
                         clusterStatePtr,
-                        (IntPtr)Unsafe.AsPointer(ref hosts),
+                        (IntPtr)Unsafe.AsPointer(ref context),
                         (IntPtr)AddHostPtr
                     );
                 }
 
-                Interlocked.Exchange(ref _cachedHosts, new CopyOnWriteDictionary<IPEndPoint, Host>(hosts.ToDictionary(h => h.Address)));
+                Interlocked.Exchange(ref _cachedHosts, new CopyOnWriteDictionary<IPEndPoint, Host>(context.NewHosts));
 
                 // Free the old cluster state pointer if it exists. Make sure to update it atomically
                 // and before calling free to avoid other threads reading a freed pointer.

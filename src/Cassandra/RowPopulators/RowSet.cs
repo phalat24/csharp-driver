@@ -339,7 +339,7 @@ namespace Cassandra
                         return RustBridge.FfiException.FromException(
                             new IndexOutOfRangeException($"Column index {index} is out of range (0..{columns.Length - 1})")
                         );
-                    } 
+                    }
 
                     var col = columns[index];
                     col.Name = name.ToManagedString();

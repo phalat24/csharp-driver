@@ -37,19 +37,19 @@ namespace Cassandra.IntegrationTests.Core
             var hosts = Cluster.AllHosts();
             Assert.NotNull(hosts, "AllHosts() should not return null");
             Assert.AreEqual(3, hosts.Count, "AllHosts() should return the same number of hosts as the cluster size");
-            
+
             foreach (var host in hosts)
             {
                 Assert.NotNull(host, "Host should not be null");
-                
+
                 // HostId Validation
                 Assert.AreNotEqual(Guid.Empty, host.HostId, "Host.HostId should be a valid Guid");
-                
+
                 // Address Validation
                 Assert.NotNull(host.Address, "Host.Address should not be null");
                 Assert.AreNotEqual(0, host.Address.Port, "Host.Address.Port should not be 0");
                 Assert.NotNull(host.Address.Address, "Host.Address.Address should not be null");
-                
+
                 // Metadata Properties Validation
                 Assert.NotNull(host.Datacenter, "Host.Datacenter should not be null");
                 Assert.IsNotEmpty(host.Datacenter, "Host.Datacenter should be populated");
@@ -114,7 +114,7 @@ namespace Cassandra.IntegrationTests.Core
             Assert.Greater(allHosts.Count, 0, "Need at least one host for this test");
             var firstHost = allHosts.First();
             var address = firstHost.Address;
-            
+
             var retrievedHost = metadata.GetHost(address);
             Assert.NotNull(retrievedHost, "Metadata.GetHost() should not return null for a valid address");
             Assert.AreEqual(address, retrievedHost.Address, "Retrieved host should have the same address");
@@ -150,19 +150,19 @@ namespace Cassandra.IntegrationTests.Core
         [Test]
         public void Metadata_Hosts_Should_Be_Cached_When_Topology_Is_Stable()
         {
-            // Validates that repeated calls without topology changes return the same Host instances 
+            // Validates that repeated calls without topology changes return the same Host instances
             // verifying the caching mechanism.
             var metadata = Cluster.Metadata;
             var hosts1 = metadata.AllHosts();
             var hosts2 = metadata.AllHosts();
 
             Assert.AreEqual(hosts1.Count, hosts2.Count);
-            
+
             var host1 = hosts1.OrderBy(h => h.Address.ToString()).First();
             var host2 = hosts2.OrderBy(h => h.Address.ToString()).First();
-            
+
             Assert.AreEqual(host1.Address, host2.Address);
-            
+
             // Check reference equality to ensure caching is working and we are not recreating objects unnecessarily
             Assert.AreSame(host1, host2, "Expected same property Host instance when topology is stable");
         }

@@ -35,27 +35,48 @@ namespace Cassandra
     public class Metadata : IDisposable
     {
 #pragma warning disable CS0067
+        private const int HostIdLength = 16;
         public event HostsEventHandler HostsEvent;
 
         public event SchemaChangedEventHandler SchemaChangedEvent;
 #pragma warning restore CS0067
 
-        [DllImport("csharp_wrapper", CallingConvention = CallingConvention.Cdecl)]
+        [DllImport(NativeLibrary.CSharpWrapper, CallingConvention = CallingConvention.Cdecl)]
+        private static extern bool cluster_state_compare_ptr(
+            IntPtr ptr1,
+            IntPtr ptr2);
+
+        [DllImport(NativeLibrary.CSharpWrapper, CallingConvention = CallingConvention.Cdecl)]
         private static extern IntPtr cluster_state_get_raw_ptr(IntPtr clusterStatePtr);
 
-        [DllImport("csharp_wrapper", CallingConvention = CallingConvention.Cdecl)]
-        private static extern void cluster_state_fill_nodes(
+        [DllImport(NativeLibrary.CSharpWrapper, CallingConvention = CallingConvention.Cdecl)]
+        private static extern RustBridge.FfiException cluster_state_fill_nodes(
             IntPtr clusterStatePtr,
             IntPtr contextPtr,
-            IntPtr callback);
+            IntPtr callback,
+            IntPtr constructors);
 
-        [DllImport("csharp_wrapper", CallingConvention = CallingConvention.Cdecl)]
+        [DllImport(NativeLibrary.CSharpWrapper, CallingConvention = CallingConvention.Cdecl)]
         private static extern void cluster_state_free(IntPtr clusterStatePtr);
 
-        private static readonly unsafe delegate* unmanaged[Cdecl]<IntPtr, FFIByteSlice,  FFIByteSlice, ushort, FFIString, FFIString, void> AddHostPtr = &AddHostToList;
+        private static readonly unsafe delegate* unmanaged[Cdecl]<IntPtr, FFIByteSlice, FFIByteSlice, ushort, FFIString, FFIString, RustBridge.FfiException> AddHostPtr = &AddHostToList;
+
+        private static readonly unsafe delegate* unmanaged[Cdecl]<IntPtr, IntPtr, int, void> OnReplicaPairPtr = &OnReplicaPairCallback;
+
+        // NOTE: Token map replica resolution without table context currently forces Murmur3
+        // on the Rust side via cluster_state_get_replicas_murmur3.
+        [DllImport(NativeLibrary.CSharpWrapper, CallingConvention = CallingConvention.Cdecl)]
+        private static extern RustBridge.FfiException cluster_state_get_replicas_murmur3(
+            IntPtr clusterStatePtr,
+            [MarshalAs(UnmanagedType.LPUTF8Str)] string keyspace,
+            [In] byte[] partitionKey,
+            nuint partitionKeyLen,
+            IntPtr callbackState,
+            IntPtr callback,
+            IntPtr constructors);
 
         [UnmanagedCallersOnly(CallConvs = new Type[] { typeof(CallConvCdecl) })]
-        private static unsafe void AddHostToList(
+        private static unsafe RustBridge.FfiException AddHostToList(
             IntPtr contextPtr,
             FFIByteSlice idBytes,
             FFIByteSlice ipBytes,
@@ -65,48 +86,70 @@ namespace Cassandra
         {
             try
             {
-                // Safety:
-                // contextPtr is a pointer to the stack slot holding the 'context' reference (not to the heap object itself).
-                // Unsafe.AsPointer(ref T) returns the address of the managed pointer (the stack local).
-                // The stack slot is stable for the duration of this callback since:
-                // 1. cluster_state_fill_nodes calls this callback synchronously before returning
-                // 2. The stack frame containing 'context' remains alive throughout the FFI call
-                // 3. If GC moves the RefreshContext object on the heap, it updates the reference value in the stack slot
-                // 4. Unsafe.Read dereferences the pointer to get the current reference value
-                // This matches the pattern used in row_set_fill_columns_metadata.
                 var context = Unsafe.AsRef<RefreshContext>((void*)contextPtr);
 
                 var hostId = new Guid(idBytes.ToSpan());
 
-                // Construct IPAddress directly from bytes (4 for IPv4, 16 for IPv6). ipBytes is an FFIByteSlice
-                // and it accesses unmanaged memory that is only valid for the duration of this callback invocation.
-                // The IPAddress constructor must be called synchronously here so it can copy the data immediately.
                 var ipAddress = new IPAddress(ipBytes.ToSpan());
                 var address = new IPEndPoint(ipAddress, port);
 
-                // Try to reuse existing host object if id matches and address is the same
                 if (context.OldHosts != null && context.OldHosts.TryGetValue(hostId, out var host))
                 {
-                    // If the address matches, reuse the instance.
                     if (host.Address.Equals(address))
                     {
                         context.AddHost(host);
-                        return;
+                        return RustBridge.FfiException.Ok();
                     }
                 }
 
                 var dcString = datacenter.ToManagedString();
                 var rackString = rack.ToManagedString();
 
-                // Create Host instance and add it to the dictionaries.
                 host = new Host(address, hostId, dcString, rackString);
                 context.AddHost(host);
+                return RustBridge.FfiException.Ok();
             }
             catch (Exception ex)
             {
-                // Do not throw across FFI boundary - causes undefined behavior.
-                // Fail fast to match Rust's panic=abort behavior and make the error obvious.
-                Environment.FailFast("Fatal error in AddHostCallback", ex);
+                return RustBridge.FfiException.FromException(ex);
+            }
+        }
+
+        private class GetReplicasContext(IReadOnlyDictionary<Guid, Host> hostsById)
+        {
+            public List<HostShard> Replicas { get; } = [];
+            public IReadOnlyDictionary<Guid, Host> HostsById { get; } = hostsById;
+        }
+
+        [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
+        private static unsafe void OnReplicaPairCallback(IntPtr statePtr, IntPtr hostIdBytesPtr, int shard)
+        {
+            try
+            {
+                // Safety: statePtr points to the stack slot holding the managed GetReplicasContext reference
+                // (same pattern as RowSet.SetColumnMeta and Metadata.AddHostToList).
+                var context = Unsafe.AsRef<GetReplicasContext>((void*)statePtr);
+                if (context == null)
+                {
+                    Environment.FailFast("Invalid context in OnReplicaPairCallback");
+                }
+
+                var hostIdBytes = new ReadOnlySpan<byte>((void*)hostIdBytesPtr, HostIdLength);
+                var hostId = new Guid(hostIdBytes);
+
+                if (context.HostsById.TryGetValue(hostId, out var host))
+                {
+                    context.Replicas.Add(new HostShard(host, shard));
+                }
+                else
+                {
+                    // Host not found in metadata, possibly removed or inconsistent state.
+                    // We could log this, but for now we just skip it.
+                }
+            }
+            catch (Exception ex)
+            {
+                Environment.FailFast("Fatal error in OnReplicaPairCallback", ex);
             }
         }
 
@@ -215,23 +258,7 @@ namespace Cassandra
         {
             throw new NotImplementedException();
         }
-
-        // for tests
-        internal KeyValuePair<string, KeyspaceMetadata>[] KeyspacesSnapshot => throw new NotImplementedException();
-
-        /// <summary>
-        /// Get the replicas for a given partition key and keyspace
-        /// </summary>
-        public ICollection<HostShard> GetReplicas(string keyspaceName, byte[] partitionKey)
-        {
-            throw new NotImplementedException();
-        }
-
-        public ICollection<HostShard> GetReplicas(byte[] partitionKey)
-        {
-            throw new NotImplementedException();
-        }
-
+        
         /// <summary>
         /// Returns a registry instance, refreshing topology if needed.
         /// At most one caller performs the refresh (single-flight), others
@@ -303,17 +330,109 @@ namespace Cassandra
         private void RefreshTopologyCacheInternal(IntPtr clusterStatePtr)
         {
             var context = new RefreshContext(_hostRegistry.HostsById);
-            unsafe
+            RustBridge.FfiException res = default;
+            try
             {
-                cluster_state_fill_nodes(
-                    clusterStatePtr,
-                    (IntPtr)Unsafe.AsPointer(ref context),
-                    (IntPtr)AddHostPtr
-                );
+                unsafe
+                {
+                    res = cluster_state_fill_nodes(
+                        clusterStatePtr,
+                        (IntPtr)Unsafe.AsPointer(ref context),
+                        (IntPtr)AddHostPtr,
+                        (IntPtr)RustBridgeGlobals.ConstructorsPtr
+                    );
+
+                    RustBridge.ThrowIfException(ref res);
+                }
             }
+            finally
+            {
+                RustBridge.FreeExceptionHandle(ref res);
+            }
+
+            GC.KeepAlive(context);
 
             // Swap both maps together via a new HostRegistry created from the context so readers never see mismatched maps.
             Interlocked.Exchange(ref _hostRegistry, context.ToNewRegistry());
+        }
+
+
+        // for tests
+        internal KeyValuePair<string, KeyspaceMetadata>[] KeyspacesSnapshot => throw new NotImplementedException();
+
+        /// <summary>
+        /// Get the replicas for a given partition key and keyspace
+        /// </summary>
+        public ICollection<HostShard> GetReplicas(string keyspaceName, byte[] partitionKey)
+        {
+            var session = _getActiveSessionOrThrow();
+            // FIXME: Handle session disposal race condition similar to AllHosts
+
+            // Request a fresh cluster state pointer for the native replica calculation.
+            // We get it once and free it in the finally block below.
+            var ptr = session.GetClusterStatePtr();
+            try
+            {
+                // Fetch the latest topology registry for HostId -> Host resolution.
+                var hostRegistry = GetRegistry();
+
+                var context = new GetReplicasContext(hostRegistry.HostsById);
+
+                IntPtr callbackPtr;
+                unsafe
+                {
+                    callbackPtr = (IntPtr)OnReplicaPairPtr;
+                }
+
+                // Pass a pointer to the stack-local slot that holds the managed 'context' reference.
+                // The native function is expected to invoke callbacks synchronously before returning.
+                unsafe
+                {
+                    void* contextPtr = Unsafe.AsPointer(ref context);
+
+                    // NOTE: C# Metadata.GetReplicas doesn't provide the table name.
+                    // For correctness, token computation should use the cluster/table partitioner; and for Scylla
+                    // tablet routing we also need table context. Until we extend the API/bridge, force Murmur3.
+                    // FIXME: Use metadata-derived partitioner
+                    RustBridge.FfiException res = default;
+                    try
+                    {
+                        res = cluster_state_get_replicas_murmur3(
+                            ptr,
+                            keyspaceName,
+                            partitionKey,
+                            (nuint)(partitionKey?.Length ?? 0),
+                            (IntPtr)contextPtr,
+                            callbackPtr,
+                            (IntPtr)RustBridgeGlobals.ConstructorsPtr
+                        );
+
+                        RustBridge.ThrowIfException(ref res);
+                    }
+                    finally
+                    {
+                        RustBridge.FreeExceptionHandle(ref res);
+                    }
+                }
+
+                GC.KeepAlive(context);
+
+                return context.Replicas;
+            }
+            finally
+            {
+                cluster_state_free(ptr);
+            }
+        }
+
+        public ICollection<HostShard> GetReplicas(byte[] partitionKey)
+        {
+            // TODO: is it even correct?
+            // The idea is to retrieve the primary replicas for the partition key when the keyspace is not specified,
+            // since no replication strategy can be applied - that's how it worked in the original driver.
+            // In this case, when no keyspace is specified, the Rust side replica locator with fall back to the default
+            // Simple Strategy with RF = 1, which achieves exactly what we're aiming for.
+            return GetReplicas("", partitionKey);
         }
 
         /// <summary>

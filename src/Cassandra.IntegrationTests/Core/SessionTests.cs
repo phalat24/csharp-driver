@@ -15,9 +15,7 @@
 //
 
 using System.Diagnostics;
-
 using Cassandra.Tests;
-
 using NUnit.Framework;
 using Assert = NUnit.Framework.Legacy.ClassicAssert;
 

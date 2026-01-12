@@ -173,11 +173,10 @@ pub extern "C" fn session_use_keyspace(
     tcb: Tcb,
     session_ptr: BridgedBorrowedSharedPtr<'_, BridgedSession>,
     keyspace: CSharpStr<'_>,
-    case_sensitive: i32,
+    case_sensitive: bool,
 ) {
     let keyspace = keyspace.as_cstr().unwrap().to_str().unwrap().to_owned();
     let bridged_session = ArcFFI::cloned_from_ptr(session_ptr).unwrap();
-    let case_sensitive = case_sensitive != 0;
 
     tracing::trace!(
         "[FFI] Scheduling use_keyspace: \"{}\" (case_sensitive: {})",

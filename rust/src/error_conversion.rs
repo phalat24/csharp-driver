@@ -5,6 +5,7 @@ use scylla::errors::{
     PagerExecutionError, PrepareError, RequestAttemptError, RequestError,
 };
 use std::fmt::{Debug, Display};
+use thiserror::Error;
 
 use crate::task::ExceptionConstructors;
 
@@ -117,6 +118,19 @@ impl RequestInvalidExceptionConstructor {
     }
 }
 
+/// FFI constructor for C# `AlreadyShutdownException`.
+#[repr(transparent)]
+pub struct AlreadyShutdownExceptionConstructor(
+    unsafe extern "C" fn(message: FFIStr<'_>) -> ExceptionPtr,
+);
+
+impl AlreadyShutdownExceptionConstructor {
+    pub(crate) fn construct_from_rust(&self, message: &str) -> ExceptionPtr {
+        let message = FFIStr::new(message);
+        unsafe { (self.0)(message) }
+    }
+}
+
 /// FFI constructor for C# `SyntaxErrorException`.
 #[repr(transparent)]
 pub struct SyntaxErrorExceptionConstructor(
@@ -195,6 +209,19 @@ impl InvalidQueryConstructor {
     }
 }
 
+// Special errors for C# wrapper.
+
+/// Wrapper enum to represent errors that may occur normally or indicate that the session has been
+/// shut down. It allows to return a clear error condition while satisfying the return type requirements.
+#[derive(Error, Debug, Clone)]
+pub(crate) enum MaybeShutdownError<E> {
+    #[error("Error: {0}")]
+    Inner(E),
+
+    #[error("Session has been shut down and can no longer execute operations")]
+    AlreadyShutdown,
+}
+
 /// Trait for converting Rust error types into pointers to C# exceptions using constructors from the TCB.
 ///
 /// # Purpose
@@ -212,6 +239,13 @@ impl InvalidQueryConstructor {
 /// The handle must be freed on the C# side when no longer needed.
 pub trait ErrorToException {
     fn to_exception(&self, ctors: &ExceptionConstructors) -> ExceptionPtr;
+}
+
+// This allows returning Infallible as an error type in functions that cannot fail.
+impl ErrorToException for std::convert::Infallible {
+    fn to_exception(&self, _ctors: &ExceptionConstructors) -> ExceptionPtr {
+        match *self {}
+    }
 }
 
 // Specific mapping for PagerExecutionError.
@@ -302,6 +336,22 @@ impl ErrorToException for (&DbError, &str) {
             _ => ctors
                 .rust_exception_constructor
                 .construct_from_rust(db_error),
+        }
+    }
+}
+
+impl<E> ErrorToException for MaybeShutdownError<E>
+where
+    E: ErrorToException,
+{
+    fn to_exception(&self, ctors: &ExceptionConstructors) -> ExceptionPtr {
+        match self {
+            MaybeShutdownError::Inner(e) => e.to_exception(ctors),
+            MaybeShutdownError::AlreadyShutdown => ctors
+                .already_shutdown_exception_constructor
+                .construct_from_rust(
+                    "Session has been shut down and can no longer execute operations",
+                ),
         }
     }
 }

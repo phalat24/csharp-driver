@@ -63,8 +63,9 @@ namespace Cassandra
         unsafe private static extern void row_set_free(IntPtr rowSetPtr);
 
         [DllImport("csharp_wrapper", CallingConvention = CallingConvention.Cdecl)]
-        // bool does not work well with C FFI, use int instead (0 = false, non-0 = true).
-        unsafe private static extern int row_set_next_row(IntPtr rowSetPtr, IntPtr deserializeValue, IntPtr columnsPtr, IntPtr valuesPtr, IntPtr serializerPtr);
+
+        [return: MarshalAs(UnmanagedType.U1)]
+        unsafe private static extern bool row_set_next_row(IntPtr rowSetPtr, IntPtr deserializeValue, IntPtr columnsPtr, IntPtr valuesPtr, IntPtr serializerPtr);
 
         [DllImport("csharp_wrapper", CallingConvention = CallingConvention.Cdecl)]
         unsafe private static extern nuint row_set_get_columns_count(IntPtr rowSetPtr);
@@ -383,7 +384,7 @@ namespace Cassandra
             {
                 unsafe
                 {
-                    bool has_row = row_set_next_row(handle, (IntPtr)deserializeValue, columnsPtr, valuesPtr, serializerPtr) != 0;
+                    bool has_row = row_set_next_row(handle, (IntPtr)deserializeValue, columnsPtr, valuesPtr, serializerPtr);
                     if (!has_row)
                     {
                         _exhausted = true;

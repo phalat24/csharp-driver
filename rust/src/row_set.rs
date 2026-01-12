@@ -102,21 +102,10 @@ pub extern "C" fn row_set_fill_columns_metadata(
         };
 
         let is_frozen = match spec.typ() {
-            ColumnType::Collection { frozen, .. } => {
-                if *frozen {
-                    1
-                } else {
-                    0
-                }
+            ColumnType::Collection { frozen, .. } | ColumnType::UserDefinedType { frozen, .. } => {
+                *frozen
             }
-            ColumnType::UserDefinedType { frozen, .. } => {
-                if *frozen {
-                    1
-                } else {
-                    0
-                }
-            }
-            _ => 0,
+            _ => false,
         };
 
         unsafe {
@@ -128,7 +117,7 @@ pub extern "C" fn row_set_fill_columns_metadata(
                 table,
                 type_code,
                 type_info_handle,
-                is_frozen,
+                is_frozen as u8,
             );
         }
     }
@@ -170,11 +159,11 @@ pub extern "C" fn row_set_next_row<'row_set>(
     columns_ptr: ColumnsPtr,
     values_ptr: ValuesPtr,
     serializer_ptr: SerializerPtr,
-) -> i32 {
+) -> bool {
     let row_set = ArcFFI::as_ref(row_set_ptr).unwrap();
     let mut pager_guard = row_set.pager.lock().unwrap();
     let Some(pager) = pager_guard.as_mut() else {
-        return 0; // Empty RowSet has no rows
+        return false; // Empty RowSet has no rows
     };
     let num_columns = pager.column_specs().len();
 
@@ -222,7 +211,7 @@ pub extern "C" fn row_set_next_row<'row_set>(
 
     // This is inherently inefficient, but necessary due to blocking C# API upon page boundaries.
     // TODO: implement async C# API (IAsyncEnumerable) to avoid this.
-    BridgedFuture::block_on(deserialize_fut) as i32
+    BridgedFuture::block_on(deserialize_fut)
 }
 
 // TODO: Below change all unwrap() to unwrap_or_else() with proper error handling

@@ -22,9 +22,9 @@ pub extern "C" fn prepared_statement_free(
 #[unsafe(no_mangle)]
 pub extern "C" fn prepared_statement_is_lwt(
     prepared_statement_ptr: BridgedBorrowedSharedPtr<'_, BridgedPreparedStatement>,
-) -> i32 {
+) -> bool {
     ArcFFI::as_ref(prepared_statement_ptr)
         .unwrap()
         .inner
-        .is_confirmed_lwt() as _
+        .is_confirmed_lwt()
 }

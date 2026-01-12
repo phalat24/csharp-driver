@@ -58,7 +58,7 @@ namespace Cassandra
         /// </summary>
         
         [DllImport("csharp_wrapper", CallingConvention = CallingConvention.Cdecl)]
-        unsafe private static extern void session_use_keyspace(Tcb tcb, IntPtr session, [MarshalAs(UnmanagedType.LPUTF8Str)] string keyspace, int isCaseSensitive);
+        unsafe private static extern void session_use_keyspace(Tcb tcb, IntPtr session, [MarshalAs(UnmanagedType.LPUTF8Str)] string keyspace, [MarshalAs(UnmanagedType.U1)] bool isCaseSensitive);
         
         [DllImport("csharp_wrapper", CallingConvention = CallingConvention.Cdecl)]
         unsafe private static extern void session_prepare(Tcb tcb, IntPtr session, [MarshalAs(UnmanagedType.LPUTF8Str)] string statement);
@@ -349,8 +349,8 @@ namespace Cassandra
                         if (isUseStatement)
                         {
                             // For USE statements, call the dedicated use_keyspace method
-                            // case_sensitive = 1 (true) to respect the exact casing provided.
-                            session_use_keyspace(tcb, handle, newKeyspace, 1);
+                            // case_sensitive = true to respect the exact casing provided.
+                            session_use_keyspace(tcb, handle, newKeyspace, true);
                         }
                         else
                         {

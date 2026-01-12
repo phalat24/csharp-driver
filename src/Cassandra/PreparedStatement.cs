@@ -40,7 +40,8 @@ namespace Cassandra
         }
 
         [DllImport("csharp_wrapper", CallingConvention = CallingConvention.Cdecl)]
-        unsafe private static extern int prepared_statement_is_lwt(IntPtr prepared_statement);
+        [return: MarshalAs(UnmanagedType.U1)]
+        unsafe private static extern bool prepared_statement_is_lwt(IntPtr prepared_statement);
 
         [DllImport("csharp_wrapper", CallingConvention = CallingConvention.Cdecl)]
         unsafe private static extern void prepared_statement_free(IntPtr prepared_statement);
@@ -136,7 +137,7 @@ namespace Cassandra
         internal PreparedStatement(IntPtr preparedStatementPtr, string cql, RowSetMetadata variablesRowsMetadata) : base(IntPtr.Zero, true)
         {
             handle = preparedStatementPtr;
-            bool isLwt = prepared_statement_is_lwt(preparedStatementPtr) != 0;
+            bool isLwt = prepared_statement_is_lwt(preparedStatementPtr);
 
             _variablesRowsMetadata = variablesRowsMetadata;
             Cql = cql;

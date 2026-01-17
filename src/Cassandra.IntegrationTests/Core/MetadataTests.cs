@@ -42,9 +42,12 @@ namespace Cassandra.IntegrationTests.Core
             {
                 Assert.NotNull(host, "Host should not be null");
                 
+<<<<<<< HEAD
                 // HostId Validation
                 Assert.AreNotEqual(Guid.Empty, host.HostId, "Host.HostId should be a valid Guid");
                 
+=======
+>>>>>>> 5b993ee9 (Simple tests for topology metadata)
                 // Address Validation
                 Assert.NotNull(host.Address, "Host.Address should not be null");
                 Assert.AreNotEqual(0, host.Address.Port, "Host.Address.Port should not be 0");
@@ -53,8 +56,16 @@ namespace Cassandra.IntegrationTests.Core
                 // Metadata Properties Validation
                 Assert.NotNull(host.Datacenter, "Host.Datacenter should not be null");
                 Assert.IsNotEmpty(host.Datacenter, "Host.Datacenter should be populated");
+<<<<<<< HEAD
                 Assert.NotNull(host.Rack, "Host.Rack should not be null");
                 Assert.IsNotEmpty(host.Rack, "Host.Rack should be populated");
+=======
+                
+                Assert.NotNull(host.Rack, "Host.Rack should not be null");
+                Assert.IsNotEmpty(host.Rack, "Host.Rack should be populated");
+                
+                Assert.AreNotEqual(Guid.Empty, host.HostId, "Host.HostId should be a valid Guid");
+>>>>>>> 5b993ee9 (Simple tests for topology metadata)
             }
 
             // Verify Uniqueness

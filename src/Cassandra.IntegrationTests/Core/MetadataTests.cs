@@ -17,7 +17,6 @@
 using System;
 using System.Linq;
 using System.Net;
-using System.Threading;
 using Cassandra.Tests;
 using NUnit.Framework;
 using Assert = NUnit.Framework.Legacy.ClassicAssert;
@@ -36,7 +35,47 @@ namespace Cassandra.IntegrationTests.Core
         {
             var hosts = Cluster.AllHosts();
             Assert.NotNull(hosts, "AllHosts() should not return null");
-            Assert.AreEqual(3, hosts.Count, "AllHosts() should return the same number of hosts as the cluster size");
+            var hostCount = hosts.Count;
+            
+            // Debug output: print expected and retrieved hosts to aid troubleshooting when counts or properties differ
+            var expectedCount = AmountOfNodes;
+
+            // Print expected hosts derived from TestCluster (if available)
+            try
+            {
+                if (TestCluster != null)
+                {
+                    Console.WriteLine("Expected hosts (from TestCluster):");
+                    var expectedHosts = Enumerable.Range(1, AmountOfNodes)
+                        .Select(i => TestCluster.ClusterIpPrefix + i).ToList();
+                    foreach (var eh in expectedHosts)
+                    {
+                        Console.WriteLine($" - {eh}:9042");
+                    }
+                }
+                else
+                {
+                    Console.WriteLine("TestCluster is null; cannot derive expected hosts from test fixture.");
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Failed to compute expected hosts: {ex.Message}");
+            }
+
+            Console.WriteLine($"Expected hosts count: {expectedCount}");
+            Console.WriteLine($"Retrieved hosts count: {hostCount}");
+            Console.WriteLine("Retrieved hosts details:");
+
+            foreach (var h in hosts)
+            {
+                Console.WriteLine($" - Address={h?.Address?.ToString() ?? "<null>"}, HostId={(h == null ? "<null>" : h.HostId.ToString())}, DC={(h == null ? "<null>" : h.Datacenter ?? "<null>")}, Rack={(h == null ? "<null>" : h.Rack ?? "<null>")}");
+            }
+            
+            Console.WriteLine(hosts);
+            Console.WriteLine(hostCount);
+            
+            Assert.AreEqual(expectedCount, hostCount, "AllHosts() should return the same number of hosts as the cluster size");
             
             foreach (var host in hosts)
             {
@@ -70,10 +109,10 @@ namespace Cassandra.IntegrationTests.Core
 
             // Verify Uniqueness
             var uniqueHostIds = hosts.Select(h => h.HostId).Distinct().Count();
-            Assert.AreEqual(hosts.Count, uniqueHostIds, "Each host should have a unique HostId");
+            Assert.AreEqual(hostCount, uniqueHostIds, "Each host should have a unique HostId");
             
             var uniqueAddresses = hosts.Select(h => h.Address).Distinct().Count();
-            Assert.AreEqual(hosts.Count, uniqueAddresses, "Each host should have a unique Address");
+            Assert.AreEqual(hostCount, uniqueAddresses, "Each host should have a unique Address");
         }
 
         [Test]

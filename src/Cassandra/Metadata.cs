@@ -46,7 +46,7 @@ namespace Cassandra
         [DllImport("csharp_wrapper", CallingConvention = CallingConvention.Cdecl)]
         private static extern void cluster_state_fill_nodes(
             IntPtr clusterStatePtr,
-            IntPtr contextPtr,
+            IntPtr listPtr,
             IntPtr callback);
 
         [DllImport("csharp_wrapper", CallingConvention = CallingConvention.Cdecl)]

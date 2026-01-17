@@ -23,6 +23,7 @@ using System.Runtime.InteropServices;
 using System.Runtime.CompilerServices;
 using System.Threading;
 using System.Threading.Tasks;
+using Cassandra.Collections;
 using Cassandra.Tasks;
 
 namespace Cassandra

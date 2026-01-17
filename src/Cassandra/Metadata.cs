@@ -64,7 +64,7 @@ namespace Cassandra
         {
             try
             {
-                // Safety: 
+                // Safety:
                 // contextPtr is a pointer to the stack slot holding the 'context' reference (not to the heap object itself).
                 // Unsafe.AsPointer(ref T) returns the address of the managed pointer (the stack local).
                 // The stack slot is stable for the duration of this callback since:
@@ -74,11 +74,11 @@ namespace Cassandra
                 // 4. Unsafe.Read dereferences the pointer to get the current reference value
                 // This matches the pattern used in row_set_fill_columns_metadata.
                 var context = Unsafe.AsRef<RefreshContext>((void*)contextPtr);
-                
+
                 var hostId = new Guid(idBytes.ToSpan());
 
-                // Construct IPAddress directly from bytes (4 for IPv4, 16 for IPv6). ipBytes is an FFIByteSlice 
-                // and it accesses unmanaged memory that is only valid for the duration of this callback invocation. 
+                // Construct IPAddress directly from bytes (4 for IPv4, 16 for IPv6). ipBytes is an FFIByteSlice
+                // and it accesses unmanaged memory that is only valid for the duration of this callback invocation.
                 // The IPAddress constructor must be called synchronously here so it can copy the data immediately.
                 var ipAddress = new IPAddress(ipBytes.ToSpan());
                 var address = new IPEndPoint(ipAddress, port);
@@ -130,8 +130,8 @@ namespace Cassandra
         // It either returns a valid Session or throws InvalidOperationException.
         private readonly Func<Session> _getActiveSessionOrThrow;
 
-        // Pointer to the last cluster state used to detect changes. This is a raw pointer 
-        // stored only for comparison purposes - it does not extend the lifetime of the ClusterState. 
+        // Pointer to the last cluster state used to detect changes. This is a raw pointer
+        // stored only for comparison purposes - it does not extend the lifetime of the ClusterState.
         // Volatile ensures visibility of updates across threads for the lock-free read in AllHosts().
         private volatile IntPtr _lastClusterStatePtr = IntPtr.Zero;
 
@@ -143,7 +143,7 @@ namespace Cassandra
             public IReadOnlyDictionary<Guid, Host> OldHosts { get; } = oldHosts;
 
             public void AddHost(Host host)
-            {   
+            {
                 _newHosts[host.HostId] = host;
                 _newHostIdsByIp[host.Address] = host.HostId;
             }
@@ -291,7 +291,7 @@ namespace Cassandra
             }
             finally
             {
-                // Release the lock on the session created by GetActiveSessionOrThrow. 
+                // Release the lock on the session created by GetActiveSessionOrThrow.
                 session.DecreaseReferenceCount();
             }
         }

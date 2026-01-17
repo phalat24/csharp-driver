@@ -15,16 +15,12 @@
 //
 
 using System;
-using System.Collections.Concurrent;
 using System.Collections.Generic;
-using System.Linq;
 using System.Net;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
-using Cassandra.Collections;
-using Cassandra.Tasks;
 
 namespace Cassandra
 {
@@ -46,58 +42,92 @@ namespace Cassandra
         [DllImport("csharp_wrapper", CallingConvention = CallingConvention.Cdecl)]
         private static extern void cluster_state_fill_nodes(
             IntPtr clusterStatePtr,
-            IntPtr contextPtr,
+            IntPtr listPtr,
             IntPtr callback);
 
         [DllImport("csharp_wrapper", CallingConvention = CallingConvention.Cdecl)]
         private static extern void cluster_state_free(IntPtr clusterStatePtr);
 
-        private static readonly unsafe delegate* unmanaged[Cdecl]<IntPtr, FFIByteSlice, ushort, FFIByteSlice, FFIString, FFIString, void> AddHostPtr = &AddHostToList;
+        private static readonly unsafe delegate* unmanaged[Cdecl]<IntPtr, FFIByteSlice, ushort, FFIString, FFIString, FFIByteSlice, void> AddHostPtr = &AddHostToList;
 
-        [UnmanagedCallersOnly(CallConvs = new Type[] { typeof(CallConvCdecl) })]
+        private class RefreshContext(IReadOnlyDictionary<Guid, Host> oldHosts)
+        {
+            private readonly Dictionary<Guid, Host> _newHosts = new(oldHosts?.Count ?? 0);
+            private readonly Dictionary<IPEndPoint, Guid> _newHostIdsByIp = new(oldHosts?.Count ?? 0);
+
+            public IReadOnlyDictionary<Guid, Host> OldHosts { get; } = oldHosts;
+
+            public void AddHost(Host host)
+            {   
+                _newHosts[host.HostId] = host;
+                _newHostIdsByIp[host.Address] = host.HostId;
+            }
+            public HostRegistry ToNewRegistry() => new HostRegistry(_newHosts, _newHostIdsByIp);
+        }
+
+        [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
         private static unsafe void AddHostToList(
             IntPtr contextPtr,
             FFIByteSlice ipBytes,
             ushort port,
-            FFIByteSlice hostIdBytes,
             FFIString datacenter,
-            FFIString rack)
+            FFIString rack,
+            FFIByteSlice hostIdBytes)
         {
             try
             {
                 // Safety: 
-                // contextPtr is a pointer to the stack slot holding the 'hosts' reference (not to the heap object itself).
+                // contextPtr is a pointer to the stack slot holding the 'context' reference (not to the heap object itself).
                 // Unsafe.AsPointer(ref T) returns the address of the managed pointer (the stack local).
                 // The stack slot is stable for the duration of this callback since:
                 // 1. cluster_state_fill_nodes calls this callback synchronously before returning
-                // 2. The stack frame containing 'hosts' remains alive throughout the FFI call
-                // 3. If GC moves the List<Host> object on the heap, it updates the reference value in the stack slot
-                // 4. Unsafe.Read dereferences the pointer to get the current reference value
+                // 2. The stack frame containing 'context' remains alive throughout the FFI call
+                // 3. If GC moves the RefreshContext object on the heap, it updates the reference value in the stack slot
+                // 4. Unsafe.AsRef dereferences the pointer to get the current reference value
                 // This matches the pattern used in row_set_fill_columns_metadata.
                 var context = Unsafe.AsRef<RefreshContext>((void*)contextPtr);
-                // var list = Unsafe.Read<List<Host>>((void*)contextPtr);
+                if (context == null)
+                {
+                    Environment.FailFast("Could not retrieve context in AddHostCallback");
+                }
 
-                // Construct IPAddress directly from bytes (4 for IPv4, 16 for IPv6). ipBytes is an FFIByteSlice 
-                // and it accesses unmanaged memory that is only valid for the duration of this callback invocation. 
-                // The IPAddress constructor must be called synchronously here so it can copy the data immediately.
-                var ipAddress = new IPAddress(ipBytes.ToSpan());
+                // Construct IPAddress directly from bytes (4 for IPv4, 16 for IPv6).
+                var ipSpan = ipBytes.ToSpan();
+                var ipAddress = new IPAddress(ipSpan);
                 var address = new IPEndPoint(ipAddress, port);
-                
-                var hostId = new Guid(hostIdBytes.ToSpan());
 
-                var dcString = datacenter.ToManagedString();
-                var rackString = rack.ToManagedString();
+                // HostId: use the bytes provided by the FFI slice directly (no endianness manipulation).
+                // Guid(ReadOnlySpan<byte>) takes the bytes as provided and copies them.
+                var hostIdSpan = hostIdBytes.ToSpan();
+                if (hostIdSpan.Length != 16)
+                {
+                    Environment.FailFast($"Invalid hostId byte length: {hostIdSpan.Length}. Expected 16.");
+                }
+                var hostId = new Guid(hostIdSpan);
 
+                // Try to reuse existing host object if id matches and address is the same
+                if (context.OldHosts != null && context.OldHosts.TryGetValue(hostId, out var host))
+                {
+                    // If the address matches, reuse the instance.
+                    if (host.Address.Equals(address))
+                    {
+                        context.AddHost(host);
+                        return;
+                    }
+                }
 
-                // Create Host instance and add it to the dictionaries.
-                var host = new Host(address, hostId, dcString, rackString);
-                context.NewHosts[hostId] = host;
-                context.NewHostIdsByIp[address] = hostId;
+                var datacenterStr = (datacenter.ptr == IntPtr.Zero || datacenter.len == 0)
+                    ? null
+                    : datacenter.ToManagedString();
+                var rackStr = (rack.ptr == IntPtr.Zero || rack.len == 0)
+                    ? null
+                    : rack.ToManagedString();
+
+                var newHost = new Host(address, hostId, datacenterStr, rackStr);
+                context.AddHost(newHost);
             }
             catch (Exception ex)
             {
-                // Do not throw across FFI boundary - causes undefined behavior.
-                // Fail fast to match Rust's panic=abort behavior and make the error obvious.
                 Environment.FailFast("Fatal error in AddHostCallback", ex);
             }
         }
@@ -106,7 +136,7 @@ namespace Cassandra
         ///  Returns the name of currently connected cluster.
         /// </summary>
         /// <returns>the Cassandra name of currently connected cluster.</returns>
-        public String ClusterName { get; internal set; }
+        public string ClusterName { get; internal set; }
 
         /// <summary>
         /// Determines whether the cluster is provided as a service.
@@ -123,17 +153,32 @@ namespace Cassandra
         // It either returns a valid Session or throws InvalidOperationException.
         private readonly Func<Session> _getActiveSessionOrThrow;
 
-        // Pointer to the last cluster state used to detect changes. This is a raw pointer 
-        // stored only for comparison purposes - it does not extend the lifetime of the ClusterState. 
-        // Volatile ensures visibility of updates across threads for the lock-free read in AllHosts().
+        // Pointer to the last cluster state raw pointer used to detect changes.
+        // Volatile ensures visibility of updates across threads that compare it
+        // before deciding whether to trigger a refresh.
         private volatile IntPtr _lastClusterStatePtr = IntPtr.Zero;
 
-        // private CopyOnWriteDictionary<IPEndPoint, Host> _cachedHosts = new CopyOnWriteDictionary<IPEndPoint, Host>();
+        // HostRegistry groups both maps so they can be swapped atomically.
+        private sealed class HostRegistry(
+            IReadOnlyDictionary<Guid, Host> hostsById,
+            IReadOnlyDictionary<IPEndPoint, Guid> hostIdsByIp)
+        {
+            public readonly IReadOnlyDictionary<Guid, Host> HostsById =
+                hostsById ?? new Dictionary<Guid, Host>();
 
-        private CopyOnWriteDictionary<Guid, Host> _hostsById = new CopyOnWriteDictionary<Guid, Host>();
-        private CopyOnWriteDictionary<IPEndPoint, Guid> _hostIdsByIp = new CopyOnWriteDictionary<IPEndPoint, Guid>();
+            public readonly IReadOnlyDictionary<IPEndPoint, Guid> HostIdsByIp =
+                hostIdsByIp ?? new Dictionary<IPEndPoint, Guid>();
+        }
+
+        // Active host registry reference; swapped atomically on refresh.
+        // NOTE: Do not access this field directly; use GetRegistry() instead, since the accessor covers the
+        // refreshment logic, with a compromise between limited data staleness and performance.
+        private volatile HostRegistry _hostRegistry =
+            new HostRegistry(new Dictionary<Guid, Host>(), new Dictionary<IPEndPoint, Guid>());
 
         private readonly object _hostLock = new object();
+
+        private static readonly Logger Logger = new Logger(typeof(Metadata));
 
         internal Metadata(Configuration configuration, Func<Session> getActiveSessionOrThrow)
         {
@@ -143,27 +188,27 @@ namespace Cassandra
 
         public void Dispose()
         {
-            // No-op for now - metadata shutdown not yet implemented
+            // No-op for now - metadata disposal not yet implemented
             // throw new NotImplementedException();
         }
 
-        private class RefreshContext()
-        {
-            public Dictionary<Guid, Host> NewHosts { get; } = new Dictionary<Guid, Host>();
-            public Dictionary<IPEndPoint, Guid> NewHostIdsByIp { get; } = new Dictionary<IPEndPoint, Guid>();
-        }
-
+        /// <summary>
+        /// Returns the <see cref="Host"/> for the given address, using the most recent
+        /// known topology if available. If a refresh is needed, at most one caller will
+        /// perform it; others will use the last known registry (stale-ok).
+        /// </summary>
         public Host GetHost(IPEndPoint address)
         {
-            // Ensure cache is up to date
-            RefreshTopologyCache();
+            var registry = GetRegistry();
 
-            if (_hostIdsByIp.TryGetValue(address, out var hostId))
+            return !registry.HostIdsByIp.TryGetValue(address, out var hostId) ? null : registry.HostsById.GetValueOrDefault(hostId);
+        }
+
+        internal Guid? GetHostIdByIp(IPEndPoint address)
+        {
+            if (GetRegistry().HostIdsByIp.TryGetValue(address, out var hostId))
             {
-                if (_hostsById.TryGetValue(hostId, out var host))
-                {
-                    return host;
-                }
+                return hostId;
             }
 
             return null;
@@ -172,13 +217,10 @@ namespace Cassandra
         /// <summary>
         ///  Returns all known hosts of this cluster.
         /// </summary>
-        /// <returns>collection of all known hosts of this cluster.</returns>
         public ICollection<Host> AllHosts()
         {
-            // Ensure cache is up to date
-            RefreshTopologyCache();
-
-            return _hostsById.Values;
+            // Return a snapshot copy of the values as ICollection<Host>
+            return new List<Host>(GetRegistry().HostsById.Values);
         }
 
         public IEnumerable<IPEndPoint> AllReplicas()
@@ -201,72 +243,97 @@ namespace Cassandra
         {
             throw new NotImplementedException();
         }
+        
+        private bool IsClusterStateUpToDate(IntPtr clusterStatePtr)
+        {
+            var rawPtr = cluster_state_get_raw_ptr(clusterStatePtr);
+            return _lastClusterStatePtr != IntPtr.Zero && rawPtr == _lastClusterStatePtr;
+        }
 
         /// <summary>
-        /// Updates the cached topology if the cluster state has changed.
+        /// Returns a registry instance, refreshing topology if needed.
+        /// At most one caller performs the refresh (single-flight), others
+        /// will use the last known registry.
         /// </summary>
-        private void RefreshTopologyCache()
+        private HostRegistry GetRegistry()
         {
-            var session = _getActiveSessionOrThrow();
-            var clusterStatePtr = session.GetClusterStatePtr();
+            var clusterStatePtr = IntPtr.Zero;
 
             try
             {
-                // Extract the raw pointer address for comparison.
-                // This address is only valid while clusterStatePtr is alive (within this try block).
+                // Always get the session; any error should propagate
+                var session = _getActiveSessionOrThrow();
+                clusterStatePtr = session.GetClusterStatePtr();
+
                 var rawPtr = cluster_state_get_raw_ptr(clusterStatePtr);
 
-                // Check without lock if cache is still valid by comparing raw addresses.
-                // _lastClusterStatePtr stores only the address, not an owned Arc.
-                if (_lastClusterStatePtr != IntPtr.Zero && rawPtr == _lastClusterStatePtr)
+                // Fast path: no changes, no lock
+                if (IsClusterStateUpToDate(_lastClusterStatePtr))
                 {
-                    return;
+                    return _hostRegistry;
                 }
 
+                // Slow path: always block and update
                 lock (_hostLock)
                 {
-                    // Double-check: another thread may have updated the cache.
-                    // While the thread was waiting for the lock, the cluster state may have changed again.
-                    // Free the previously fetched cluster state pointer and acquire a fresh one.
-                    cluster_state_free(clusterStatePtr);
-                    clusterStatePtr = session.GetClusterStatePtr();
-                    rawPtr = cluster_state_get_raw_ptr(clusterStatePtr);
-
-                    if (_lastClusterStatePtr != IntPtr.Zero && rawPtr == _lastClusterStatePtr)
+                    // Re-check after acquiring lock
+                    if (IsClusterStateUpToDate(_lastClusterStatePtr))
                     {
-                        return;
+                        return _hostRegistry;
                     }
 
-                    // Otherwise we are forced to refill all hosts.
-                    var context = new RefreshContext();
-                    unsafe
-                    {
-                        cluster_state_fill_nodes(
-                            clusterStatePtr,
-                            // (IntPtr)Unsafe.AsPointer(ref hosts),
-                            (IntPtr)Unsafe.AsPointer(ref context),
-                            (IntPtr)AddHostPtr
-                        );
-                    }
-
-                    Interlocked.Exchange(ref _hostsById,
-                        new CopyOnWriteDictionary<Guid, Host>(context.NewHosts));
-                    Interlocked.Exchange(ref _hostIdsByIp,
-                        new CopyOnWriteDictionary<IPEndPoint, Guid>(context.NewHostIdsByIp));
-
-                    // Store the raw pointer address for future comparisons.
-                    _lastClusterStatePtr = rawPtr;
+                    RefreshTopologyCacheInternal(clusterStatePtr, rawPtr);
+                    return _hostRegistry;
                 }
             }
             finally
             {
-                // Always free the fetched cluster state pointer to avoid memory leak.
-                // This frees the Arc we got from session_get_cluster_state.
-                cluster_state_free(clusterStatePtr);
-
-                // Release the lock on the session created by GetActiveSessionOrThrow. 
-                session.DecreaseReferenceCount();
+                if (clusterStatePtr != IntPtr.Zero)
+                {
+                    cluster_state_free(clusterStatePtr);
+                }
             }
+        }
+
+
+        /// <summary>
+        /// IMPORTANT: This method may only be called after acquiring _hostLock.
+        /// 
+        /// Performs the actual topology refresh using the provided cluster state pointer
+        /// and its associated raw pointer. This method assumes that:
+        /// - clusterStatePtr was obtained from the active session
+        /// - rawPtr was obtained via cluster_state_get_raw_ptr(clusterStatePtr)
+        /// and that the caller will handle freeing clusterStatePtr.
+        /// </summary>
+        private void RefreshTopologyCacheInternal(IntPtr clusterStatePtr, IntPtr rawPtr)
+        {
+            // Use current registry's HostsById as the "oldHosts" reference for reuse logic.
+            var context = new RefreshContext(_hostRegistry.HostsById);
+
+            unsafe
+            {
+                // Pass a pointer to the stack slot containing the managed 'context' reference.
+                // cluster_state_fill_nodes is expected to invoke AddHostToList synchronously before returning.
+                void* contextPtr = Unsafe.AsPointer(ref context);
+                cluster_state_fill_nodes(
+                    clusterStatePtr,
+                    (IntPtr)contextPtr,
+                    (IntPtr)AddHostPtr
+                );
+            }
+
+            GC.KeepAlive(context);
+
+            // Swap both maps together via a new HostRegistry created from the context so readers
+            // never see mismatched maps.
+            Interlocked.Exchange(ref _hostRegistry, context.ToNewRegistry());
+
+            if (_lastClusterStatePtr != IntPtr.Zero)
+            {
+                cluster_state_free(_lastClusterStatePtr);
+            }
+
+            _lastClusterStatePtr = rawPtr;
         }
 
         /// <summary>

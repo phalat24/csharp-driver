@@ -51,11 +51,11 @@ pub extern "C" fn cluster_state_get_raw_ptr(
 /// - The callback must not throw exceptions across the FFI boundary
 type ConstructCSharpHost = unsafe extern "C" fn(
     list_ptr: *mut c_void,
-    ip_bytes_ptr: FFIByteSlice<'_>,
+    ip_bytes: FFIByteSlice<'_>,
     port: u16,
-    host_id_bytes: FFIByteSlice<'_>,
     datacenter: FFIStr<'_>,
     rack: FFIStr<'_>,
+    host_id_bytes: FFIByteSlice<'_>,
 );
 
 /// Populates a C# List<Host> with node information from the cluster state.
@@ -111,13 +111,13 @@ pub extern "C" fn cluster_state_fill_nodes(
         let rack = FFIStr::new(node.rack.as_deref().unwrap_or(""));
 
         // UUID as bytes
-        let uuid_bytes = FFIByteSlice::new(node.host_id.as_bytes());
+        let host_id_bytes = FFIByteSlice::new(node.host_id.as_bytes());
 
         // Invoke the callback to construct and add the Host to the C# list object.
         // All pointers passed to the callback are only valid during this invocation.
         // The callback must copy all data immediately.
         unsafe {
-            callback(list_ptr, ip_bytes, port, uuid_bytes, dc, rack);
+            callback(list_ptr, ip_bytes, port, dc, rack, host_id_bytes);
         }
     }
 }

@@ -155,7 +155,18 @@ namespace Cassandra
 
         public Host GetHost(IPEndPoint address)
         {
-            throw new NotImplementedException();
+            // Ensure cache is up to date
+            RefreshTopologyCache();
+
+            if (_hostIdsByIp.TryGetValue(address, out var hostId))
+            {
+                if (_hostsById.TryGetValue(hostId, out var host))
+                {
+                    return host;
+                }
+            }
+
+            return null;
         }
 
         /// <summary>
@@ -164,7 +175,10 @@ namespace Cassandra
         /// <returns>collection of all known hosts of this cluster.</returns>
         public ICollection<Host> AllHosts()
         {
-            throw new NotImplementedException();
+            // Ensure cache is up to date
+            RefreshTopologyCache();
+
+            return _hostsById.Values;
         }
 
         public IEnumerable<IPEndPoint> AllReplicas()

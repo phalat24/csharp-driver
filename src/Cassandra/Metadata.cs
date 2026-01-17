@@ -19,8 +19,11 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
 using System.Net;
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
+using Cassandra.Collections;
 using Cassandra.Tasks;
 
 namespace Cassandra
@@ -38,7 +41,66 @@ namespace Cassandra
 #pragma warning restore CS0067
 
         [DllImport("csharp_wrapper", CallingConvention = CallingConvention.Cdecl)]
+        private static extern IntPtr cluster_state_get_raw_ptr(IntPtr clusterStatePtr);
+
+        [DllImport("csharp_wrapper", CallingConvention = CallingConvention.Cdecl)]
+        private static extern void cluster_state_fill_nodes(
+            IntPtr clusterStatePtr,
+            IntPtr contextPtr,
+            IntPtr callback);
+
+        [DllImport("csharp_wrapper", CallingConvention = CallingConvention.Cdecl)]
         private static extern void cluster_state_free(IntPtr clusterStatePtr);
+
+        private static readonly unsafe delegate* unmanaged[Cdecl]<IntPtr, FFIByteSlice, ushort, FFIByteSlice, FFIString, FFIString, void> AddHostPtr = &AddHostToList;
+
+        [UnmanagedCallersOnly(CallConvs = new Type[] { typeof(CallConvCdecl) })]
+        private static unsafe void AddHostToList(
+            IntPtr contextPtr,
+            FFIByteSlice ipBytes,
+            ushort port,
+            FFIByteSlice hostIdBytes,
+            FFIString datacenter,
+            FFIString rack)
+        {
+            try
+            {
+                // Safety: 
+                // contextPtr is a pointer to the stack slot holding the 'hosts' reference (not to the heap object itself).
+                // Unsafe.AsPointer(ref T) returns the address of the managed pointer (the stack local).
+                // The stack slot is stable for the duration of this callback since:
+                // 1. cluster_state_fill_nodes calls this callback synchronously before returning
+                // 2. The stack frame containing 'hosts' remains alive throughout the FFI call
+                // 3. If GC moves the List<Host> object on the heap, it updates the reference value in the stack slot
+                // 4. Unsafe.Read dereferences the pointer to get the current reference value
+                // This matches the pattern used in row_set_fill_columns_metadata.
+                var context = Unsafe.AsRef<RefreshContext>((void*)contextPtr);
+                // var list = Unsafe.Read<List<Host>>((void*)contextPtr);
+
+                // Construct IPAddress directly from bytes (4 for IPv4, 16 for IPv6). ipBytes is an FFIByteSlice 
+                // and it accesses unmanaged memory that is only valid for the duration of this callback invocation. 
+                // The IPAddress constructor must be called synchronously here so it can copy the data immediately.
+                var ipAddress = new IPAddress(ipBytes.ToSpan());
+                var address = new IPEndPoint(ipAddress, port);
+                
+                var hostId = new Guid(hostIdBytes.ToSpan());
+
+                var dcString = datacenter.ToManagedString();
+                var rackString = rack.ToManagedString();
+
+
+                // Create Host instance and add it to the dictionaries.
+                var host = new Host(address, hostId, dcString, rackString);
+                context.NewHosts[hostId] = host;
+                context.NewHostIdsByIp[address] = hostId;
+            }
+            catch (Exception ex)
+            {
+                // Do not throw across FFI boundary - causes undefined behavior.
+                // Fail fast to match Rust's panic=abort behavior and make the error obvious.
+                Environment.FailFast("Fatal error in AddHostCallback", ex);
+            }
+        }
 
         /// <summary>
         ///  Returns the name of currently connected cluster.
@@ -61,6 +123,18 @@ namespace Cassandra
         // It either returns a valid Session or throws InvalidOperationException.
         private readonly Func<Session> _getActiveSessionOrThrow;
 
+        // Pointer to the last cluster state used to detect changes. This is a raw pointer 
+        // stored only for comparison purposes - it does not extend the lifetime of the ClusterState. 
+        // Volatile ensures visibility of updates across threads for the lock-free read in AllHosts().
+        private volatile IntPtr _lastClusterStatePtr = IntPtr.Zero;
+
+        // private CopyOnWriteDictionary<IPEndPoint, Host> _cachedHosts = new CopyOnWriteDictionary<IPEndPoint, Host>();
+
+        private CopyOnWriteDictionary<Guid, Host> _hostsById = new CopyOnWriteDictionary<Guid, Host>();
+        private CopyOnWriteDictionary<IPEndPoint, Guid> _hostIdsByIp = new CopyOnWriteDictionary<IPEndPoint, Guid>();
+
+        private readonly object _hostLock = new object();
+
         internal Metadata(Configuration configuration, Func<Session> getActiveSessionOrThrow)
         {
             Configuration = configuration;
@@ -72,6 +146,13 @@ namespace Cassandra
             // No-op for now - metadata shutdown not yet implemented
             // throw new NotImplementedException();
         }
+
+        private class RefreshContext()
+        {
+            public Dictionary<Guid, Host> NewHosts { get; } = new Dictionary<Guid, Host>();
+            public Dictionary<IPEndPoint, Guid> NewHostIdsByIp { get; } = new Dictionary<IPEndPoint, Guid>();
+        }
+
         public Host GetHost(IPEndPoint address)
         {
             throw new NotImplementedException();
@@ -105,6 +186,73 @@ namespace Cassandra
         public ICollection<HostShard> GetReplicas(byte[] partitionKey)
         {
             throw new NotImplementedException();
+        }
+
+        /// <summary>
+        /// Updates the cached topology if the cluster state has changed.
+        /// </summary>
+        private void RefreshTopologyCache()
+        {
+            var session = _getActiveSessionOrThrow();
+            var clusterStatePtr = session.GetClusterStatePtr();
+
+            try
+            {
+                // Extract the raw pointer address for comparison.
+                // This address is only valid while clusterStatePtr is alive (within this try block).
+                var rawPtr = cluster_state_get_raw_ptr(clusterStatePtr);
+
+                // Check without lock if cache is still valid by comparing raw addresses.
+                // _lastClusterStatePtr stores only the address, not an owned Arc.
+                if (_lastClusterStatePtr != IntPtr.Zero && rawPtr == _lastClusterStatePtr)
+                {
+                    return;
+                }
+
+                lock (_hostLock)
+                {
+                    // Double-check: another thread may have updated the cache.
+                    // While the thread was waiting for the lock, the cluster state may have changed again.
+                    // Free the previously fetched cluster state pointer and acquire a fresh one.
+                    cluster_state_free(clusterStatePtr);
+                    clusterStatePtr = session.GetClusterStatePtr();
+                    rawPtr = cluster_state_get_raw_ptr(clusterStatePtr);
+
+                    if (_lastClusterStatePtr != IntPtr.Zero && rawPtr == _lastClusterStatePtr)
+                    {
+                        return;
+                    }
+
+                    // Otherwise we are forced to refill all hosts.
+                    var context = new RefreshContext();
+                    unsafe
+                    {
+                        cluster_state_fill_nodes(
+                            clusterStatePtr,
+                            // (IntPtr)Unsafe.AsPointer(ref hosts),
+                            (IntPtr)Unsafe.AsPointer(ref context),
+                            (IntPtr)AddHostPtr
+                        );
+                    }
+
+                    Interlocked.Exchange(ref _hostsById,
+                        new CopyOnWriteDictionary<Guid, Host>(context.NewHosts));
+                    Interlocked.Exchange(ref _hostIdsByIp,
+                        new CopyOnWriteDictionary<IPEndPoint, Guid>(context.NewHostIdsByIp));
+
+                    // Store the raw pointer address for future comparisons.
+                    _lastClusterStatePtr = rawPtr;
+                }
+            }
+            finally
+            {
+                // Always free the fetched cluster state pointer to avoid memory leak.
+                // This frees the Arc we got from session_get_cluster_state.
+                cluster_state_free(clusterStatePtr);
+
+                // Release the lock on the session created by GetActiveSessionOrThrow. 
+                session.DecreaseReferenceCount();
+            }
         }
 
         /// <summary>

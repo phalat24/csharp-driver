@@ -19,6 +19,7 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
 using System.Net;
+using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
 using Cassandra.Tasks;
@@ -36,6 +37,9 @@ namespace Cassandra
 
         public event SchemaChangedEventHandler SchemaChangedEvent;
 #pragma warning restore CS0067
+
+        [DllImport("csharp_wrapper", CallingConvention = CallingConvention.Cdecl)]
+        private static extern void cluster_state_free(IntPtr clusterStatePtr);
 
         /// <summary>
         ///  Returns the name of currently connected cluster.

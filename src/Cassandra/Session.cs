@@ -74,6 +74,9 @@ namespace Cassandra
         [DllImport("csharp_wrapper", CallingConvention = CallingConvention.Cdecl)]
         unsafe private static extern void session_use_keyspace(Tcb tcb, IntPtr session, [MarshalAs(UnmanagedType.LPUTF8Str)] string keyspace, [MarshalAs(UnmanagedType.U1)] bool isCaseSensitive);
 
+        [DllImport("csharp_wrapper", CallingConvention = CallingConvention.Cdecl)]
+        private static extern IntPtr session_get_cluster_state(IntPtr sessionPtr);
+
         private static readonly Logger Logger = new Logger(typeof(Session));
         private readonly ICluster _cluster;
         private int _disposed;
@@ -615,6 +618,38 @@ namespace Cassandra
             }
 
             return true;
+        }
+
+        /// <summary>
+        /// Gets the ClusterState pointer from the Rust session.
+        /// The returned pointer is an FFI BridgedPtr and it transfers ownership to the caller in C#.
+        /// The caller must call cluster_state_free() exactly once for each returned pointer to avoid a memory leak.
+        /// Each call is expected to return a distinct pointer instance whose lifetime is now owned by the caller.
+        /// </summary>
+        internal IntPtr GetClusterStatePtr()
+        {
+            bool refAdded = false;
+            try
+            {
+                DangerousAddRef(ref refAdded);
+
+                var ClusterStatePtr = session_get_cluster_state(handle);
+
+                // FIXME: How do we handle errors here? Is a null pointer possible?
+                if (ClusterStatePtr == IntPtr.Zero)
+                {
+                    throw new Exception("Failed to get ClusterState from Session");
+                }
+
+                return ClusterStatePtr;
+            }
+            finally
+            {
+                if (refAdded)
+                {
+                    DangerousRelease();
+                }
+            }
         }
 
         /// <summary>

@@ -15,16 +15,12 @@
 //
 
 using System;
-using System.Collections.Concurrent;
 using System.Collections.Generic;
-using System.Linq;
 using System.Net;
 using System.Runtime.InteropServices;
 using System.Runtime.CompilerServices;
 using System.Threading;
 using System.Threading.Tasks;
-using Cassandra.Collections;
-using Cassandra.Tasks;
 
 namespace Cassandra
 {
@@ -76,7 +72,7 @@ namespace Cassandra
                 // This matches the pattern used in row_set_fill_columns_metadata.
                 var context = Unsafe.AsRef<RefreshContext>((void*)contextPtr);
 
-                var hostId = new Guid(idBytes.ToSpan());
+                var hostId = RustBridge.GuidFromFFIFormat(idBytes.ToSpan());
 
                 // Construct IPAddress directly from bytes (4 for IPv4, 16 for IPv6). ipBytes is an FFIByteSlice
                 // and it accesses unmanaged memory that is only valid for the duration of this callback invocation.
@@ -448,3 +444,4 @@ namespace Cassandra
         }
     }
 }
+

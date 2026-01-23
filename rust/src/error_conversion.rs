@@ -2,7 +2,7 @@ use crate::ffi::{FFIByteSlice, FFIStr};
 use scylla::errors::{
     ConnectionError, ConnectionPoolError, DbError, DeserializationError, MetadataError,
     NewSessionError, NextPageError, NextRowError, PagerExecutionError, PrepareError,
-    RequestAttemptError, RequestError, SerializationError,
+    RequestAttemptError, RequestError, SchemaAgreementError, SerializationError,
 };
 use std::fmt::{Debug, Display};
 use std::mem::size_of;
@@ -438,5 +438,11 @@ where
                     "Session has been shut down and can no longer execute operations",
                 ),
         }
+    }
+}
+
+impl ErrorToException for SchemaAgreementError {
+    fn to_exception(&self, ctors: &ExceptionConstructors) -> ExceptionPtr {
+        ctors.rust_exception_constructor.construct_from_rust(self)
     }
 }

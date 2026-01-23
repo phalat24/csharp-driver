@@ -1,13 +1,5 @@
 use std::convert::Infallible;
 
-use scylla::client::session::Session;
-use scylla::client::session_builder::SessionBuilder;
-use scylla::cluster::ClusterState;
-use scylla::errors::{NewSessionError, PagerExecutionError, PrepareError};
-use scylla_cql::serialize::row::SerializedValues;
-use tokio::sync::RwLock;
-
-use crate::CSharpStr;
 use crate::error_conversion::{FfiException, MaybeShutdownError};
 use crate::ffi::{
     ArcFFI, BoxFFI, BridgedBorrowedSharedPtr, BridgedOwnedExclusivePtr, BridgedOwnedSharedPtr, FFI,
@@ -17,9 +9,61 @@ use crate::pre_serialized_values::pre_serialized_values::PreSerializedValues;
 use crate::prepared_statement::BridgedPreparedStatement;
 use crate::row_set::RowSet;
 use crate::task::{BridgedFuture, ExceptionConstructors, Tcb};
+use crate::{CSharpStr, FfiPtr};
+use scylla::client::session::Session;
+use scylla::client::session_builder::SessionBuilder;
+use scylla::cluster::ClusterState;
+use scylla::errors::{NewSessionError, PagerExecutionError, PrepareError, SchemaAgreementError};
+use scylla_cql::serialize::row::SerializedValues;
+use tokio::sync::RwLock;
+use uuid::Uuid;
+
+#[allow(dead_code)]
+enum HostId {}
+
+#[repr(transparent)]
+pub struct HostIdPtr {
+    inner: FfiPtr<'static, HostId>,
+}
+
+// Number of bytes in an RFC-4122 UUID
+const UUID_BYTE_LEN: usize = 16;
+
+impl HostIdPtr {
+    /// Parse an optional UUID from this host-id pointer.
+    ///
+    /// - Returns `Ok(None)` when the pointer is null (no required node).
+    /// - When non-null, assumes the caller provided exactly `UUID_BYTE_LEN` bytes at the
+    ///   address and attempts to parse them into a `Uuid`.
+    /// - The caller (managed side) is responsible for ensuring the memory is valid and pinned.
+    pub fn parse_uuid(
+        &self,
+        constructors: &ExceptionConstructors,
+    ) -> Result<Option<Uuid>, FfiException> {
+        // If pointer is null, treat as no required node.
+        let host_id_ptr = match self.inner.ptr {
+            Some(nn) => nn.as_ptr() as *const u8,
+            None => return Ok(None),
+        };
+
+        // SAFETY: caller guarantees host_id_ptr is valid and pinned for UUID_BYTE_LEN bytes.
+        let bytes = unsafe { std::slice::from_raw_parts(host_id_ptr, UUID_BYTE_LEN) };
+
+        // Parse UUID bytes and map any error to an FfiException.
+        match Uuid::from_slice(bytes) {
+            Ok(u) => Ok(Some(u)),
+            Err(_) => {
+                let ex = constructors
+                    .rust_exception_constructor
+                    .construct_from_rust("session_await_schema_agreement: invalid uuid bytes");
+                Err(FfiException::from_exception(ex))
+            }
+        }
+    }
+}
 
 /// Internal representation of a session bridged to C#.
-/// It contains optional connected session state to allow for shutdown.
+/// It contains optional connected state to allow for shutdown.
 /// If None, the session has been shut down and cannot be used for queries.
 #[derive(Debug)]
 pub(crate) struct BridgedSessionInner {
@@ -29,7 +73,7 @@ pub(crate) struct BridgedSessionInner {
 /// BridgedSession is a thread-safe, asynchronously accessible session wrapper.
 /// It uses RwLock to allow multiple concurrent read accesses (queries)
 /// while ensuring exclusive access for write operations (shutdown).
-pub type BridgedSession = tokio::sync::RwLock<BridgedSessionInner>;
+pub type BridgedSession = RwLock<BridgedSessionInner>;
 impl FFI for BridgedSession {
     type Origin = FromArc;
 }
@@ -429,5 +473,57 @@ pub extern "C" fn session_get_cluster_state(
     unsafe {
         *out_cluster_state_ptr = ArcFFI::into_ptr(cluster_state);
     }
+    FfiException::ok()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn session_await_schema_agreement(
+    session_ptr: BridgedBorrowedSharedPtr<'_, BridgedSession>,
+    host_id: HostIdPtr,
+    tcb: Tcb,
+    constructors: &ExceptionConstructors,
+) -> FfiException {
+    // Validate session pointer early and return FfiException on error.
+    let session_arc = match ArcFFI::cloned_from_ptr(session_ptr) {
+        Some(a) => a,
+        None => {
+            let ex = constructors
+                .rust_exception_constructor
+                .construct_from_rust("invalid or null session pointer");
+            return FfiException::from_exception(ex);
+        }
+    };
+
+    let session_guard_res = session_arc.try_read_owned();
+
+    // Delegate host buffer parsing to the HostIdPtr method and return synchronous error if any.
+    let required_node = match host_id.parse_uuid(constructors) {
+        Ok(node) => node,
+        Err(e) => return e,
+    };
+
+    tracing::trace!(
+        "[FFI] Scheduling session_await_schema_agreement (required_node: {:?})",
+        required_node
+    );
+
+    // All input validated; spawn the async task and return OK.
+    BridgedFuture::spawn::<_, _, MaybeShutdownError<SchemaAgreementError>>(tcb, async move {
+        let Ok(session_guard) = session_guard_res else {
+            return Err(MaybeShutdownError::AlreadyShutdown);
+        };
+
+        let Some(session) = session_guard.session.as_ref() else {
+            return Err(MaybeShutdownError::AlreadyShutdown);
+        };
+
+        session
+            .await_schema_agreement_with_required_node_external(required_node)
+            .await
+            .map_err(MaybeShutdownError::Inner)?;
+
+        Ok(EmptyBridgedResult)
+    });
+
     FfiException::ok()
 }

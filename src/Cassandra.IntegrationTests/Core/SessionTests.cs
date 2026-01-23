@@ -14,6 +14,7 @@
 //   limitations under the License.
 //
 
+using System;
 using System.Diagnostics;
 
 using Cassandra.Tests;
@@ -120,6 +121,23 @@ namespace Cassandra.IntegrationTests.Core
             var localSession = localCluster.Connect();
             var ex = Assert.Throws<InvalidQueryException>(() => localSession.ChangeKeyspace("THIS_KEYSPACE_DOES_NOT_EXIST_EITHER"));
             Assert.True(ex.Message.ToLower().Contains("keyspace"));
+        }
+        
+        [Test]
+        public void Session_AwaitsSchemaAgreement_AfterSchemaAlteringQuery()
+        {
+            var localCluster = GetNewTemporaryCluster();
+            var localSession = localCluster.Connect();
+            localSession.Execute("CREATE KEYSPACE IF NOT EXISTS testks WITH replication = {'class': 'SimpleStrategy', 'replication_factor': '3'}");
+            localSession.ChangeKeyspace("testks");
+            var tableName = "table_" + Guid.NewGuid().ToString("N");
+            localSession.Execute($"CREATE TABLE {tableName} (id int PRIMARY KEY, value text)");
+
+            localSession.WaitForSchemaAgreement();
+            
+            // This should not throw as the schema agreement should have been reached
+            Assert.DoesNotThrow(() => 
+                localSession.Execute($"INSERT INTO {tableName} (id, value) VALUES (1, '1')"));
         }
     }
 }

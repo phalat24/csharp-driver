@@ -268,9 +268,11 @@ namespace Cassandra
         /// </summary>
         Task ShutdownAsync();
 
-        [Obsolete("Method deprecated. The driver internally waits for schema agreement when there is an schema change. See ProtocolOptions.MaxSchemaAgreementWaitSeconds for more info.")]
         void WaitForSchemaAgreement(RowSet rs);
-        [Obsolete("Method deprecated. The driver internally waits for schema agreement when there is an schema change. See ProtocolOptions.MaxSchemaAgreementWaitSeconds for more info.")]
         bool WaitForSchemaAgreement(IPEndPoint forHost);
+        Task WaitForSchemaAgreementAsync(RowSet rs);
+        Task WaitForSchemaAgreementAsync(IPEndPoint hostAddress);
+        void WaitForSchemaAgreement();
+        Task WaitForSchemaAgreementAsync();
     }
 }

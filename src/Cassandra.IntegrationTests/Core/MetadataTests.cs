@@ -26,7 +26,7 @@ namespace Cassandra.IntegrationTests.Core
     [Category(TestCategory.Short), Category(TestCategory.RealCluster)]
     public class MetadataTests : SharedClusterTest
     {
-        public MetadataTests() : base(3, true)
+        public MetadataTests() : base(3)
         {
         }
 
@@ -80,31 +80,20 @@ namespace Cassandra.IntegrationTests.Core
             foreach (var host in hosts)
             {
                 Assert.NotNull(host, "Host should not be null");
-                
-<<<<<<< HEAD
-                // HostId Validation
-                Assert.AreNotEqual(Guid.Empty, host.HostId, "Host.HostId should be a valid Guid");
-                
-=======
->>>>>>> 5b993ee9 (Simple tests for topology metadata)
+
                 // Address Validation
                 Assert.NotNull(host.Address, "Host.Address should not be null");
                 Assert.AreNotEqual(0, host.Address.Port, "Host.Address.Port should not be 0");
                 Assert.NotNull(host.Address.Address, "Host.Address.Address should not be null");
-                
+
+                // HostId Validation
+                Assert.AreNotEqual(Guid.Empty, host.HostId, "Host.HostId should be a valid Guid");
+
                 // Metadata Properties Validation
                 Assert.NotNull(host.Datacenter, "Host.Datacenter should not be null");
                 Assert.IsNotEmpty(host.Datacenter, "Host.Datacenter should be populated");
-<<<<<<< HEAD
                 Assert.NotNull(host.Rack, "Host.Rack should not be null");
                 Assert.IsNotEmpty(host.Rack, "Host.Rack should be populated");
-=======
-                
-                Assert.NotNull(host.Rack, "Host.Rack should not be null");
-                Assert.IsNotEmpty(host.Rack, "Host.Rack should be populated");
-                
-                Assert.AreNotEqual(Guid.Empty, host.HostId, "Host.HostId should be a valid Guid");
->>>>>>> 5b993ee9 (Simple tests for topology metadata)
             }
 
             // Verify Uniqueness

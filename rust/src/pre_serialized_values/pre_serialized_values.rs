@@ -58,7 +58,7 @@ impl PreSerializedValues {
     ///   of this call. The data is copied into the internal buffer immediately.
     /// - If `value.len > 0`, then `value.ptr` must be non-null and point to at least `len`
     ///   bytes of initialized memory.
-    pub(super) unsafe fn add_value(
+    pub(super) fn add_value(
         &mut self,
         value: CsharpSerializedValue,
     ) -> Result<(), SerializationError> {

@@ -494,5 +494,35 @@ namespace Cassandra
                 res.exception = IntPtr.Zero;
             }
         }
+
+        /// <summary>
+        /// Convert a .NET <see cref="Guid"/> to the RFC 4122 / network (big-endian) byte
+        /// order used by native code (for example Rust's <c>Uuid::from_slice</c>).
+        ///
+        /// Reason: .NET's Guid.ToByteArray() (and <c>Guid.TryWriteBytes</c>) use a mixed-endian
+        /// layout on little-endian platforms (the first three fields are written in little-endian),
+        /// while RFC 4122 (and the Rust uuid crate) expect the canonical network byte order
+        /// (big-endian). Passing .NET's raw Guid bytes directly over FFI will therefore produce
+        /// the wrong UUID value on the native side (observed as a byte-order mismatch).
+        ///
+        /// Use this helper wherever a Guid must be marshaled to native code as a 16-byte UUID
+        /// to ensure the bytes are ordered per RFC 4122.
+        /// </summary>
+        internal static byte[] GuidToFFIFormat(Guid guid)
+        {
+            // Reuse existing GuidShuffle logic that converts the mixed-endian .NET layout
+            // to RFC 4122 / network order.
+            return Serialization.TypeSerializer.GuidShuffle(guid.ToByteArray());
+        }
+
+        /// <summary>
+        /// Convert from RFC 4122 / network order
+        /// to the mixed-endian .NET layout.
+        /// </summary>
+        internal static Guid GuidFromFFIFormat(ReadOnlySpan<byte> bytes)
+        {
+            // the GuidShuffle method is symmetric
+            return new Guid(Serialization.TypeSerializer.GuidShuffle(bytes.ToArray()));
+        }
     }
 }

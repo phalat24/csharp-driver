@@ -173,13 +173,13 @@ impl BridgedFuture {
 /// Used to represent futures that cannot fail.
 pub(crate) enum ImpossibleError {}
 
-impl std::fmt::Debug for ImpossibleError {
+impl Debug for ImpossibleError {
     fn fmt(&self, _: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match *self {}
     }
 }
 
-impl std::fmt::Display for ImpossibleError {
+impl Display for ImpossibleError {
     fn fmt(&self, _: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match *self {}
     }

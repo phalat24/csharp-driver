@@ -16,7 +16,6 @@
 
 using System;
 using System.Collections.Generic;
-using System.Linq;
 using System.Net;
 using System.Runtime.InteropServices;
 using System.Threading;
@@ -24,7 +23,6 @@ using System.Threading.Tasks;
 
 using Cassandra.ExecutionProfiles;
 using Cassandra.Metrics;
-using Cassandra.Serialization;
 using Cassandra.Tasks;
 
 namespace Cassandra
@@ -40,20 +38,20 @@ namespace Cassandra
             return true;
         }
 
-        [DllImport("csharp_wrapper", CallingConvention = CallingConvention.Cdecl)]
-        unsafe private static extern void session_create(Tcb tcb, [MarshalAs(UnmanagedType.LPUTF8Str)] string uri);
+        [DllImport(NativeLibrary.CSharpWrapper, CallingConvention = CallingConvention.Cdecl)]
+        private static extern void session_create(Tcb tcb, [MarshalAs(UnmanagedType.LPUTF8Str)] string uri);
 
-        [DllImport("csharp_wrapper", CallingConvention = CallingConvention.Cdecl)]
-        unsafe private static extern void session_shutdown(Tcb tcb, IntPtr session);
+        [DllImport(NativeLibrary.CSharpWrapper, CallingConvention = CallingConvention.Cdecl)]
+        private static extern void session_shutdown(Tcb tcb, IntPtr session);
 
-        [DllImport("csharp_wrapper", CallingConvention = CallingConvention.Cdecl)]
-        unsafe private static extern void empty_bridged_result_free(IntPtr phantomResult);
+        [DllImport(NativeLibrary.CSharpWrapper, CallingConvention = CallingConvention.Cdecl)]
+        private static extern void empty_bridged_result_free(IntPtr phantomResult);
 
-        [DllImport("csharp_wrapper", CallingConvention = CallingConvention.Cdecl)]
-        unsafe private static extern void session_free(IntPtr session);
+        [DllImport(NativeLibrary.CSharpWrapper, CallingConvention = CallingConvention.Cdecl)]
+        private static extern void session_free(IntPtr session);
 
-        [DllImport("csharp_wrapper", CallingConvention = CallingConvention.Cdecl)]
-        unsafe private static extern void session_query(Tcb tcb, IntPtr session, [MarshalAs(UnmanagedType.LPUTF8Str)] string statement);
+        [DllImport(NativeLibrary.CSharpWrapper, CallingConvention = CallingConvention.Cdecl)]
+        private static extern void session_query(Tcb tcb, IntPtr session, [MarshalAs(UnmanagedType.LPUTF8Str)] string statement);
 
         /// <summary>
         /// Executes a query with already-serialized values.
@@ -62,20 +60,27 @@ namespace Cassandra
         /// Values, once passed to this method, should not be used again in managed code, it's the Rust side's responsibility to handle retries
         /// and to free the memory.
         /// </summary>
-        [DllImport("csharp_wrapper", CallingConvention = CallingConvention.Cdecl)]
-        unsafe private static extern void session_query_with_values(Tcb tcb, IntPtr session, [MarshalAs(UnmanagedType.LPUTF8Str)] string statement, IntPtr valuesPtr);
+        [DllImport(NativeLibrary.CSharpWrapper, CallingConvention = CallingConvention.Cdecl)]
+        private static extern void session_query_with_values(Tcb tcb, IntPtr session, [MarshalAs(UnmanagedType.LPUTF8Str)] string statement, IntPtr valuesPtr);
 
-        [DllImport("csharp_wrapper", CallingConvention = CallingConvention.Cdecl)]
-        unsafe private static extern void session_prepare(Tcb tcb, IntPtr session, [MarshalAs(UnmanagedType.LPUTF8Str)] string statement);
+        [DllImport(NativeLibrary.CSharpWrapper, CallingConvention = CallingConvention.Cdecl)]
+        private static extern void session_prepare(Tcb tcb, IntPtr session, [MarshalAs(UnmanagedType.LPUTF8Str)] string statement);
 
-        [DllImport("csharp_wrapper", CallingConvention = CallingConvention.Cdecl)]
-        unsafe private static extern void session_query_bound(Tcb tcb, IntPtr session, IntPtr preparedStatement);
+        [DllImport(NativeLibrary.CSharpWrapper, CallingConvention = CallingConvention.Cdecl)]
+        private static extern void session_query_bound(Tcb tcb, IntPtr session, IntPtr preparedStatement);
 
-        [DllImport("csharp_wrapper", CallingConvention = CallingConvention.Cdecl)]
-        unsafe private static extern void session_use_keyspace(Tcb tcb, IntPtr session, [MarshalAs(UnmanagedType.LPUTF8Str)] string keyspace, [MarshalAs(UnmanagedType.U1)] bool isCaseSensitive);
+        [DllImport(NativeLibrary.CSharpWrapper, CallingConvention = CallingConvention.Cdecl)]
+        private static extern void session_use_keyspace(Tcb tcb, IntPtr session, [MarshalAs(UnmanagedType.LPUTF8Str)] string keyspace, [MarshalAs(UnmanagedType.U1)] bool isCaseSensitive);
 
-        [DllImport("csharp_wrapper", CallingConvention = CallingConvention.Cdecl)]
+        [DllImport(NativeLibrary.CSharpWrapper, CallingConvention = CallingConvention.Cdecl)]
         private static extern RustBridge.FfiException session_get_cluster_state(IntPtr sessionPtr, out IntPtr clusterStatePtr, IntPtr constructorsPtr);
+
+        [DllImport(NativeLibrary.CSharpWrapper, CallingConvention = CallingConvention.Cdecl)]
+        private static extern RustBridge.FfiException session_await_schema_agreement(
+            IntPtr sessionPtr,
+            [In] byte[] hostId,
+            Tcb tcb,
+            IntPtr constructorsPtr);
 
         private static readonly Logger Logger = new Logger(typeof(Session));
         private readonly ICluster _cluster;
@@ -112,6 +117,9 @@ namespace Cassandra
         public string SessionName { get; }
 
         public Policies Policies => Configuration.Policies;
+        
+        // Explicit sentinel value for the native "no required node" for WaitForSchemaAgreement
+        private static readonly byte[] NoRequiredNode = null;
 
         private Session(
             ICluster cluster,
@@ -482,7 +490,7 @@ namespace Cassandra
         {
             var task = PrepareAsync(cqlQuery, keyspace, customPayload);
             // FIXME: Add removed Metrics.
-            TaskHelper.WaitToComplete(task, Configuration.ClientOptions.QueryAbortTimeout);
+            TaskHelper.WaitToComplete(task, Configuration.DefaultRequestOptions.QueryAbortTimeout);
             return task.Result;
         }
 
@@ -558,13 +566,77 @@ namespace Cassandra
 
         public void WaitForSchemaAgreement(RowSet rs)
         {
-            // Deprecated and implemented as no-op.
+            // TODO: Implement this overload once ExecutionInfo is implemented.
         }
 
+        // FIXME: For backward compatibility, the function returns a bool, but I can't see much sense in it now.
+        // In the current implementation, it always returns false.
         public bool WaitForSchemaAgreement(IPEndPoint hostAddress)
         {
-            // Deprecated and implemented as no-op.
+            // Temporarily a no-op until ExecutionInfo is implemented.
+            // TODO: Implement this overload once ExecutionInfo is implemented.
             return false;
+        }
+
+        public Task WaitForSchemaAgreementAsync(RowSet rs)
+        {
+            // Temporarily a no-op until ExecutionInfo is implemented.
+            // TODO: Implement this overload once ExecutionInfo is implemented.
+            return Task.CompletedTask;
+        }
+
+        public Task WaitForSchemaAgreementAsync(IPEndPoint hostAddress)
+        {
+            // Temporarily a no-op until ExecutionInfo is implemented.
+            // TODO: Implement this overload once ExecutionInfo is implemented.
+            return Task.CompletedTask;
+        }
+
+        public void WaitForSchemaAgreement()
+        {
+            TaskHelper.WaitToComplete(WaitForSchemaAgreementAsync());
+        }
+        public async Task WaitForSchemaAgreementAsync()
+        {
+            await WaitForSchemaAgreementAsyncInternal(null).ConfigureAwait(false);
+        }
+
+        private async Task WaitForSchemaAgreementAsyncInternal(Guid? requiredNode)
+        {
+            var tcs = new TaskCompletionSource<IntPtr>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var tcb = Tcb.WithTcs(tcs);
+
+            bool refAdded = false;
+            try
+            {
+                DangerousAddRef(ref refAdded);
+
+                var hostIdParam = requiredNode.HasValue ? RustBridge.GuidToFFIFormat(requiredNode.Value) : NoRequiredNode;
+
+                unsafe
+                {
+                    var res = session_await_schema_agreement(
+                        handle,
+                        hostIdParam,
+                        tcb,
+                        (IntPtr)RustBridgeGlobals.ConstructorsPtr);
+
+                    RustBridge.ThrowIfException(ref res);
+                }
+            }
+            finally
+            {
+                if (refAdded)
+                {
+                    DangerousRelease();
+                }
+            }
+
+            var phantomResult = await tcs.Task.ConfigureAwait(false);
+            if (phantomResult != IntPtr.Zero)
+            {
+                empty_bridged_result_free(phantomResult);
+            }
         }
 
         private IStatement GetDefaultStatement(string cqlQuery)

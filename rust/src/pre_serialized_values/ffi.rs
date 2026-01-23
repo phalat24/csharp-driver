@@ -15,7 +15,7 @@ pub extern "C" fn pre_serialized_values_new() -> BridgedOwnedExclusivePtr<PreSer
 /// # Safety
 /// `value_ptr` and the data it points to must remain valid for the duration of this call.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn pre_serialized_values_add_value(
+pub extern "C" fn pre_serialized_values_add_value(
     values_ptr: BridgedBorrowedExclusivePtr<'_, PreSerializedValues>,
     value_ptr: CsharpValuePtr,
     value_len: usize,
@@ -25,7 +25,7 @@ pub unsafe extern "C" fn pre_serialized_values_add_value(
         panic!("invalid PreSerializedValues pointer in pre_serialized_values_add_value");
     };
     let value = CsharpSerializedValue::new(value_ptr, value_len);
-    match unsafe { values.add_value(value) } {
+    match values.add_value(value) {
         Ok(()) => FfiException::ok(),
         Err(e) => FfiException::from_error(e, constructors),
     }

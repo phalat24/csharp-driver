@@ -1,12 +1,16 @@
-use crate::error_conversion::FFIMaybeException;
+use crate::error_conversion::{FFIMaybeException, MetadataBridgeError};
 use crate::ffi::{
     ArcFFI, BridgedBorrowedSharedPtr, CSharpStr, FFI, FFIBool, FFIPtr, FFISlice, FFIStr, FromArc,
     RefFFI, ffi_callback_for_each,
 };
+use crate::pre_serialized_values::PreSerializedValues;
 use crate::row_set::column_type_to_code;
 use crate::task::ExceptionConstructors;
-use scylla::cluster::ClusterState;
-use scylla::cluster::metadata::ColumnType;
+use scylla::cluster::metadata::{ColumnType, Strategy};
+use scylla::cluster::{ClusterState, Node};
+use scylla::frame::response::result::TableSpec;
+use scylla::routing::partitioner::PartitionerName;
+use scylla::routing::{Shard, Token};
 
 impl FFI for ClusterState {
     type Origin = FromArc;
@@ -26,6 +30,9 @@ pub struct RefreshContextPtr(FFIPtr<'static, RefreshContext>);
 /// 1. Constructing a C# Host object from the provided data
 /// 2. Adding the Host to the C# RefreshContext referenced by refresh_context_ptr
 ///
+/// Returns an `FFIException` to propagate any managed exception back to Rust.
+/// On success the callback must return `FFIException::ok()`.
+///
 /// # Safety
 /// - All pointer parameters must be immediately copied/consumed during the callback invocation
 /// - String pointers (datacenter_ptr, rack_ptr) are only valid for the duration of the callback
@@ -39,6 +46,17 @@ type ConstructCSharpHost = unsafe extern "C" fn(
     datacenter: FFIStr<'_>,
     rack: FFIStr<'_>,
 );
+
+enum ReplicaList {}
+
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+pub struct ReplicasCallbackContext<'a>(FFIPtr<'a, ReplicaList>);
+type OnReplicaPair<'a> = unsafe extern "C" fn(
+    callback_context: ReplicasCallbackContext<'a>,
+    host_id_bytes_as_ptr: *const u8,
+    shard: i32,
+) -> FFIMaybeException;
 
 /// Populates a C# RefreshContext with node information from the cluster state.
 /// For each node in the cluster state, this function:
@@ -116,6 +134,114 @@ pub extern "C" fn cluster_state_fill_nodes(
     }
 
     FFIMaybeException::ok()
+}
+
+/// Ephemeral per-call helper: separates validation, serialization, and token computation
+/// from the actual replica lookup and callback invocation logic.
+///
+/// This path supports Cassandra backward-compatible behavior where callers may
+/// not provide table context. Token ownership is computed against the explicit
+/// partitioner (currently Murmur3) and replicas are resolved from the ring.
+struct RustReplicaBridge<'a> {
+    cluster_state: &'a ClusterState,
+    keyspace_name: &'a str,
+    token: Token,
+}
+
+impl<'a> RustReplicaBridge<'a> {
+    const NO_TABLE_NAME_PROVIDED: &'static str = "";
+
+    const TOKEN_RING_FALLBACK_STRATEGY: Strategy = Strategy::SimpleStrategy {
+        replication_factor: 1,
+    };
+
+    fn pre_serialized_values_from(
+        partition_key: FFISlice<'a, u8>,
+    ) -> Result<PreSerializedValues, MetadataBridgeError> {
+        let mut psv = PreSerializedValues::new();
+        psv.add_value(partition_key)?;
+        Ok(psv)
+    }
+
+    fn callback_foreach_replica<'ctx, N>(
+        replicas: impl Iterator<Item = (N, Shard)>,
+        callback_context: ReplicasCallbackContext<'ctx>,
+        callback: OnReplicaPair<'ctx>,
+    ) -> FFIMaybeException
+    where
+        N: AsRef<Node>,
+    {
+        for (node, shard) in replicas {
+            let host_id_bytes = node.as_ref().host_id.as_bytes();
+            let res = unsafe { callback(callback_context, host_id_bytes.as_ptr(), shard as i32) };
+            if res.has_exception() {
+                return res;
+            }
+        }
+        FFIMaybeException::ok()
+    }
+
+    /// Constructs a bridge for token-ring-based replica routing.
+    ///
+    /// This path intentionally supports Cassandra backward-compatible behavior where
+    /// callers may not provide table context. It computes token ownership against the
+    /// explicit partitioner (currently Murmur3) and then resolves replicas from the ring.
+    fn new_token_ring_based(
+        cluster_state: &'a ClusterState,
+        keyspace: CSharpStr<'a>,
+        partitioner: PartitionerName,
+        psv: PreSerializedValues,
+    ) -> Result<Self, MetadataBridgeError> {
+        let keyspace_name = keyspace
+            .as_cstr()
+            .ok_or(MetadataBridgeError::NullKeyspaceName)?
+            .to_str()
+            .map_err(MetadataBridgeError::InvalidKeyspaceNameUtf8)?;
+
+        let serialized_values = psv.into_serialized_values();
+
+        let token = cluster_state
+            .compute_token_preserialized_with_partitioner(&partitioner, &serialized_values)
+            .map_err(MetadataBridgeError::TokenComputationFailed)?;
+
+        Ok(Self {
+            cluster_state,
+            keyspace_name,
+            token,
+        })
+    }
+
+    fn token_ring_table_spec(&self) -> TableSpec<'a> {
+        TableSpec::borrowed(self.keyspace_name, Self::NO_TABLE_NAME_PROVIDED)
+    }
+
+    /// Returns the replication strategy that should be used for token-ring replica lookup.
+    ///
+    /// If the keyspace metadata is available, we reuse its configured strategy.
+    /// Otherwise, we fall back to `SimpleStrategy { replication_factor: 1 }`.
+    fn token_ring_strategy(&self) -> &Strategy {
+        self.cluster_state
+            .get_keyspace(self.keyspace_name)
+            .map(|ks| &ks.strategy)
+            .unwrap_or(&Self::TOKEN_RING_FALLBACK_STRATEGY)
+    }
+
+    /// Retrieve replicas and call `callback` for each replica.
+    fn get_replicas<'ctx>(
+        &self,
+        callback_context: ReplicasCallbackContext<'ctx>,
+        callback: OnReplicaPair<'ctx>,
+    ) -> FFIMaybeException {
+        let table_spec = self.token_ring_table_spec();
+        let strategy = self.token_ring_strategy();
+        let replicas = self.cluster_state.replica_locator().replicas_for_token(
+            self.token,
+            strategy,
+            None,
+            &table_spec,
+        );
+        Self::callback_foreach_replica(replicas.into_iter(), callback_context, callback)
+    }
 }
 
 /// Opaque type representing the C# KeyspaceNameList.
@@ -716,4 +842,34 @@ pub extern "C" fn cluster_state_get_table_metadata(
     }
 
     FFIMaybeException::ok()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn cluster_state_get_replicas_legacy_murmur3<'ctx>(
+    cluster_state_ptr: BridgedBorrowedSharedPtr<'_, ClusterState>,
+    keyspace: CSharpStr<'_>,
+    partition_key: FFISlice<'_, u8>,
+    callback_context: ReplicasCallbackContext<'ctx>,
+    callback: OnReplicaPair<'ctx>,
+    exception_constructors: &ExceptionConstructors,
+) -> FFIMaybeException {
+    let cluster_state =
+        ArcFFI::as_ref(cluster_state_ptr).expect("valid and non-null ClusterState pointer");
+
+    let psv = match RustReplicaBridge::pre_serialized_values_from(partition_key) {
+        Ok(psv) => psv,
+        Err(e) => return FFIMaybeException::from_error(e, exception_constructors),
+    };
+
+    let bridge = match RustReplicaBridge::new_token_ring_based(
+        cluster_state,
+        keyspace,
+        PartitionerName::Murmur3,
+        psv,
+    ) {
+        Ok(b) => b,
+        Err(e) => return FFIMaybeException::from_error(e, exception_constructors),
+    };
+
+    bridge.get_replicas(callback_context, callback)
 }

@@ -15,9 +15,7 @@
 //
 
 using System;
-using System.Collections.Concurrent;
 using System.Collections.Generic;
-using System.Linq;
 using System.Net;
 using System.Threading;
 using System.Threading.Tasks;
@@ -37,7 +35,6 @@ namespace Cassandra
 
         public event SchemaChangedEventHandler SchemaChangedEvent;
 #pragma warning restore CS0067
-
         /// <summary>
         ///  Returns the name of currently connected cluster.
         /// </summary>
@@ -147,29 +144,12 @@ namespace Cassandra
             throw new NotImplementedException();
         }
 
-        // for tests
-        internal KeyValuePair<string, KeyspaceMetadata>[] KeyspacesSnapshot => throw new NotImplementedException();
-
-        /// <summary>
-        /// Get the replicas for a given partition key and keyspace
-        /// </summary>
-        public ICollection<HostShard> GetReplicas(string keyspaceName, byte[] partitionKey)
-        {
-            throw new NotImplementedException();
-        }
-
-        public ICollection<HostShard> GetReplicas(byte[] partitionKey)
-        {
-            throw new NotImplementedException();
-        }
-
         /// <summary>
         /// Returns a registry instance, refreshing topology if needed.
         /// </summary>
         private HostRegistry GetRegistry()
         {
             var session = _getActiveSessionOrThrow();
-
             try
             {
                 // First, try to perform a lock-free read.
@@ -219,7 +199,6 @@ namespace Cassandra
             }
             finally
             {
-                // Release the lock on the session created by calling _getActiveSessionOrThrow. 
                 session.DecreaseReferenceCount();
             }
         }
@@ -234,6 +213,53 @@ namespace Cassandra
 
             // Atomically replace the host registry reference with the new one.
             Interlocked.Exchange(ref _hostRegistry, context.ToNewRegistry());
+        }
+
+        /// <summary>
+        /// When the caller doesn't specify a keyspace (either by passing `null` or using
+        /// the overload that omits the keyspace), we send this sentinel value to
+        /// the Rust bridge. The native replica locator treats the empty string as a
+        /// signal to fall back to a SimpleStrategy replication factor of 1.
+        /// </summary>
+        private const string NoSpecifiedKeyspace = "";
+
+        /// <summary>
+        /// Get the replicas for a given partition key and keyspace
+        /// </summary>
+        public ICollection<HostShard> GetReplicas(string keyspaceName, byte[] partitionKey)
+        {
+            ArgumentNullException.ThrowIfNull(partitionKey);
+
+            var session = _getActiveSessionOrThrow();
+            try
+            {
+                using var clusterState = session.GetClusterState();
+                var hostRegistry = GetRegistry();
+
+                // NOTE: C# Metadata.GetReplicas doesn't provide the table name.
+                // For correctness, token computation should use the cluster/table partitioner; and for Scylla
+                // tablet routing we also need table context. Until we extend the API/bridge, force Murmur3.
+                // FIXME: Use metadata-derived partitioner
+
+                // Coalesce null keyspace to sentinel so the Rust side falls back to
+                // SimpleStrategy RF=1, returning only the primary replica.
+                return clusterState.GetReplicasLegacyMurmur3(
+                    keyspaceName ?? NoSpecifiedKeyspace, hostRegistry.HostsById, partitionKey);
+            }
+            finally
+            {
+                session.DecreaseReferenceCount();
+            }
+        }
+
+        public ICollection<HostShard> GetReplicas(byte[] partitionKey)
+        {
+            // TODO: is it even correct?
+            // The idea is to retrieve the primary replicas for the partition key when the keyspace is not specified,
+            // since no replication strategy can be applied - that's how it worked in the original driver.
+            // In this case, when no keyspace is specified, the Rust side replica locator with fall back to the default
+            // Simple Strategy with RF = 1, which achieves exactly what we're aiming for.
+            return GetReplicas(NoSpecifiedKeyspace, partitionKey);
         }
 
         /// <summary>

@@ -56,11 +56,6 @@ namespace Cassandra
         // It either returns a valid Session or throws InvalidOperationException.
         private readonly Func<Session> _getActiveSessionOrThrow;
 
-        // Pointer to the last cluster state used to detect changes. This is a raw pointer 
-        // stored only for comparison purposes - it does not extend the lifetime of the ClusterState. 
-        // Volatile ensures visibility of updates across threads for the lock-free read in AllHosts().
-        private volatile BridgedClusterState _lastClusterState = null;
-
         internal class RefreshContext(IReadOnlyDictionary<Guid, Host> oldHosts)
         {
             private readonly Dictionary<Guid, Host> _newHosts = new Dictionary<Guid, Host>();
@@ -89,11 +84,17 @@ namespace Cassandra
                 hostIdsByIp ?? new Dictionary<IPEndPoint, Guid>();
         }
 
-        // Active host registry reference; swapped atomically on refresh.
-        // NOTE: Do not access this field directly; use GetRegistry() instead, since the accessor covers the
-        // refreshment logic, with a compromise between limited data staleness and performance.
-        private volatile HostRegistry _hostRegistry =
-            new HostRegistry(new Dictionary<Guid, Host>(), new Dictionary<IPEndPoint, Guid>());
+        // ClusterSnapshot couples a BridgedClusterState with the HostRegistry built from it.
+        // Old snapshots are not disposed eagerly on replacement; callers may still be using them.
+        private sealed class ClusterSnapshot(BridgedClusterState state, HostRegistry registry) : IDisposable
+        {
+            internal BridgedClusterState State { get; } = state;
+            internal HostRegistry Registry { get; } = registry;
+
+            public void Dispose() => State.Dispose();
+        }
+
+        private volatile ClusterSnapshot _cachedSnapshot = null;
 
         private readonly object _hostLock = new object();
 
@@ -107,21 +108,21 @@ namespace Cassandra
         {
             lock (_hostLock)
             {
-                _lastClusterState?.Dispose();
-                _lastClusterState = null;
+                _cachedSnapshot?.Dispose();
+                _cachedSnapshot = null;
             }
         }
 
         public Host GetHost(IPEndPoint address)
         {
-            var registry = GetRegistry();
+            var registry = GetSnapshot().Registry;
 
             return !registry.HostIdsByIp.TryGetValue(address, out var hostId) ? null : registry.HostsById.GetValueOrDefault(hostId);
         }
 
         internal Guid? GetHostIdByIp(IPEndPoint address)
         {
-            if (GetRegistry().HostIdsByIp.TryGetValue(address, out var hostId))
+            if (GetSnapshot().Registry.HostIdsByIp.TryGetValue(address, out var hostId))
             {
                 return hostId;
             }
@@ -136,7 +137,7 @@ namespace Cassandra
         public ICollection<Host> AllHosts()
         {
             // Return a snapshot copy of the values as ICollection<Host>
-            return new List<Host>(GetRegistry().HostsById.Values);
+            return new List<Host>(GetSnapshot().Registry.HostsById.Values);
         }
 
         public IEnumerable<IPEndPoint> AllReplicas()
@@ -147,7 +148,7 @@ namespace Cassandra
         /// <summary>
         /// Returns a registry instance, refreshing topology if needed.
         /// </summary>
-        private HostRegistry GetRegistry()
+        private ClusterSnapshot GetSnapshot()
         {
             var session = _getActiveSessionOrThrow();
             try
@@ -156,21 +157,23 @@ namespace Cassandra
                 // This is the fast path in the common case where the cluster state has not changed.
                 using (var clusterState = session.GetClusterState())
                 {
+                    var cachedSnapshot = _cachedSnapshot;
+
                     // If a cached cluster state exists, try to increase its reference count
                     // to use it for comparison without taking the lock.
-                    if (_lastClusterState != null && _lastClusterState.TryIncreaseReferenceCount())
+                    if (cachedSnapshot != null && cachedSnapshot.State.TryIncreaseReferenceCount())
                     {
                         try
                         {
-                            if (_lastClusterState.Equals(clusterState))
+                            if (cachedSnapshot.State.Equals(clusterState))
                             {
-                                return _hostRegistry;
+                                return cachedSnapshot;
                             }
                         }
                         finally
                         {
                             // Release the reference acquired above.
-                            _lastClusterState.DecreaseReferenceCount();
+                            cachedSnapshot.State.DecreaseReferenceCount();
                         }
                     }
                 }
@@ -180,21 +183,22 @@ namespace Cassandra
                 {
                     // Acquire fresh pointer inside lock - the cluster state may have changed while we waited for lock.
                     var clusterState = session.GetClusterState();
+                    var cachedSnapshot = _cachedSnapshot;
+
                     // Double-check: another thread may have updated the cache while we waited for lock.
-                    if (_lastClusterState != null && _lastClusterState.Equals(clusterState))
+                    if (cachedSnapshot != null && cachedSnapshot.State.Equals(clusterState))
                     {
                         clusterState.Dispose();
-                        return _hostRegistry;
+                        return cachedSnapshot;
                     }
 
                     // If cluster state changed, and cache is stale, refresh it.
-                    RefreshTopologyCache(clusterState);
+                    var newSnapshot = RefreshTopologyCache(clusterState, cachedSnapshot?.Registry);
 
-                    // Dispose the old state as we don't need it anymore.
-                    var oldState = Interlocked.Exchange(ref _lastClusterState, clusterState);
-                    oldState?.Dispose();
+                    Interlocked.Exchange(ref _cachedSnapshot, newSnapshot);
+                    // We cannot dispose the old snapshot here 
 
-                    return _hostRegistry;
+                    return newSnapshot;
                 }
             }
             finally
@@ -206,13 +210,11 @@ namespace Cassandra
         /// <summary>
         /// Updates the cached topology if the cluster state has changed.
         /// </summary>
-        private void RefreshTopologyCache(BridgedClusterState clusterState)
+        private static ClusterSnapshot RefreshTopologyCache(BridgedClusterState clusterState, HostRegistry oldRegistry)
         {
-            var context = new RefreshContext(_hostRegistry.HostsById);
+            var context = new RefreshContext(oldRegistry?.HostsById ?? new Dictionary<Guid, Host>());
             clusterState.FillHostCache(context);
-
-            // Atomically replace the host registry reference with the new one.
-            Interlocked.Exchange(ref _hostRegistry, context.ToNewRegistry());
+            return new ClusterSnapshot(clusterState, context.ToNewRegistry());
         }
 
         /// <summary>
@@ -230,26 +232,17 @@ namespace Cassandra
         {
             ArgumentNullException.ThrowIfNull(partitionKey);
 
-            var session = _getActiveSessionOrThrow();
-            try
-            {
-                using var clusterState = session.GetClusterState();
-                var hostRegistry = GetRegistry();
+            var snapshot = GetSnapshot();
 
-                // NOTE: C# Metadata.GetReplicas doesn't provide the table name.
-                // For correctness, token computation should use the cluster/table partitioner; and for Scylla
-                // tablet routing we also need table context. Until we extend the API/bridge, force Murmur3.
-                // FIXME: Use metadata-derived partitioner
+            // NOTE: C# Metadata.GetReplicas doesn't provide the table name.
+            // For correctness, token computation should use the cluster/table partitioner; and for Scylla
+            // tablet routing we also need table context. Until we extend the API/bridge, force Murmur3.
+            // FIXME: Use metadata-derived partitioner
 
-                // Coalesce null keyspace to sentinel so the Rust side falls back to
-                // SimpleStrategy RF=1, returning only the primary replica.
-                return clusterState.GetReplicasLegacyMurmur3(
-                    keyspaceName ?? NoSpecifiedKeyspace, hostRegistry.HostsById, partitionKey);
-            }
-            finally
-            {
-                session.DecreaseReferenceCount();
-            }
+            // Coalesce null keyspace to sentinel so the Rust side falls back to
+            // SimpleStrategy RF=1, returning only the primary replica.
+            return snapshot.State.GetReplicasLegacyMurmur3(
+                keyspaceName ?? NoSpecifiedKeyspace, snapshot.Registry.HostsById, partitionKey);
         }
 
         public ICollection<HostShard> GetReplicas(byte[] partitionKey)

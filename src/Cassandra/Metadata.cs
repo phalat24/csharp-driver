@@ -85,13 +85,52 @@ namespace Cassandra
         }
 
         // ClusterSnapshot couples a BridgedClusterState with the HostRegistry built from it.
-        // Old snapshots are not disposed eagerly on replacement; callers may still be using them.
-        private sealed class ClusterSnapshot(BridgedClusterState state, HostRegistry registry) : IDisposable
+        // Each instance owns a reference count on the underlying BridgedClusterState (SafeHandle),
+        // analogous to Arc in Rust. Construction increments the refcount; Dispose decrements it.
+        // The native resource is freed only when the last refcount drops.
+        private sealed class ClusterSnapshot : IDisposable
         {
-            internal BridgedClusterState State { get; } = state;
-            internal HostRegistry Registry { get; } = registry;
+            internal BridgedClusterState State { get; }
+            internal HostRegistry Registry { get; }
 
-            public void Dispose() => State.Dispose();
+            /// <summary>
+            /// Clones an existing snapshot, incrementing the refcount on the underlying state.
+            /// Analogous to <c>Arc::clone</c> in Rust.
+            /// </summary>
+            /// <exception cref="ObjectDisposedException">The source snapshot's state has already been freed.</exception>
+            internal static ClusterSnapshot CloneByRef(ClusterSnapshot other)
+            {
+                if (!other.State.TryIncreaseReferenceCount())
+                    throw new ObjectDisposedException(nameof(ClusterSnapshot),
+                        "Cannot clone a snapshot whose native state has already been freed.");
+                return new ClusterSnapshot(other.State, other.Registry);
+            }
+
+            /// <summary>
+            /// Takes ownership of an existing refcount on <paramref name="state"/>.
+            /// Used when building from a freshly acquired BridgedClusterState.
+            /// </summary>
+            private ClusterSnapshot(BridgedClusterState state, HostRegistry registry)
+            {
+                State = state;
+                Registry = registry;
+            }
+
+            /// <summary>
+            /// Builds a new snapshot from a freshly acquired <paramref name="state"/>,
+            /// taking ownership of its refcount. Reuses existing Host instances from
+            /// <paramref name="oldRegistry"/> where possible.
+            /// </summary>
+            internal static ClusterSnapshot BuildFromFreshState(
+                BridgedClusterState state, HostRegistry oldRegistry)
+            {
+                var context = new RefreshContext(
+                    oldRegistry?.HostsById ?? new Dictionary<Guid, Host>());
+                state.FillHostCache(context);
+                return new ClusterSnapshot(state, context.ToNewRegistry());
+            }
+
+            public void Dispose() => State.DecreaseReferenceCount();
         }
 
         private volatile ClusterSnapshot _cachedSnapshot = null;
@@ -108,26 +147,25 @@ namespace Cassandra
         {
             lock (_hostLock)
             {
-                _cachedSnapshot?.Dispose();
-                _cachedSnapshot = null;
+                var old = Interlocked.Exchange(ref _cachedSnapshot, null);
+                old?.Dispose();
             }
         }
 
         public Host GetHost(IPEndPoint address)
         {
-            var registry = GetSnapshot().Registry;
-
-            return !registry.HostIdsByIp.TryGetValue(address, out var hostId) ? null : registry.HostsById.GetValueOrDefault(hostId);
+            using var snapshot = GetSnapshot();
+            return !snapshot.Registry.HostIdsByIp.TryGetValue(address, out var hostId)
+                ? null
+                : snapshot.Registry.HostsById.GetValueOrDefault(hostId);
         }
 
         internal Guid? GetHostIdByIp(IPEndPoint address)
         {
-            if (GetSnapshot().Registry.HostIdsByIp.TryGetValue(address, out var hostId))
-            {
-                return hostId;
-            }
-
-            return null;
+            using var snapshot = GetSnapshot();
+            return snapshot.Registry.HostIdsByIp.TryGetValue(address, out var hostId)
+                ? hostId
+                : null;
         }
 
         /// <summary>
@@ -136,8 +174,8 @@ namespace Cassandra
         /// <returns>collection of all known hosts of this cluster.</returns>
         public ICollection<Host> AllHosts()
         {
-            // Return a snapshot copy of the values as ICollection<Host>
-            return new List<Host>(GetSnapshot().Registry.HostsById.Values);
+            using var snapshot = GetSnapshot();
+            return new List<Host>(snapshot.Registry.HostsById.Values);
         }
 
         public IEnumerable<IPEndPoint> AllReplicas()
@@ -146,75 +184,63 @@ namespace Cassandra
         }
 
         /// <summary>
-        /// Returns a registry instance, refreshing topology if needed.
+        /// Returns a <see cref="ClusterSnapshot"/> that owns a refcount on the underlying native state.
+        /// The caller MUST dispose the returned snapshot when done (e.g. via <c>using</c>).
         /// </summary>
         private ClusterSnapshot GetSnapshot()
         {
             var session = _getActiveSessionOrThrow();
             try
             {
-                // First, try to perform a lock-free read.
-                // This is the fast path in the common case where the cluster state has not changed.
-                using (var clusterState = session.GetClusterState())
+                // Fast path: lock-free read.
+                // Probe the current cluster state and compare against the cached snapshot.
+                using (var probeState = session.GetClusterState())
                 {
-                    var cachedSnapshot = _cachedSnapshot;
-
-                    // If a cached cluster state exists, try to increase its reference count
-                    // to use it for comparison without taking the lock.
-                    if (cachedSnapshot != null && cachedSnapshot.State.TryIncreaseReferenceCount())
+                    var cached = _cachedSnapshot;
+                    if (cached != null)
                     {
                         try
                         {
-                            if (cachedSnapshot.State.Equals(clusterState))
-                            {
-                                return cachedSnapshot;
-                            }
+                            // Clone the snapshot (increments refcount). If the state was
+                            // already disposed by a concurrent replacement, this throws
+                            // and we fall through to the slow path.
+                            var borrowed = ClusterSnapshot.CloneByRef(cached);
+                            if (borrowed.State.Equals(probeState))
+                                return borrowed;
+
+                            // Not a match — release the clone.
+                            borrowed.Dispose();
                         }
-                        finally
-                        {
-                            // Release the reference acquired above.
-                            cachedSnapshot.State.DecreaseReferenceCount();
-                        }
+                        catch (ObjectDisposedException) { }
                     }
                 }
 
-                // Acquire the host lock to perform update if needed.
+                // Slow path: cluster state changed (or no cache exists). Take the lock and rebuild.
                 lock (_hostLock)
                 {
-                    // Acquire fresh pointer inside lock - the cluster state may have changed while we waited for lock.
-                    var clusterState = session.GetClusterState();
-                    var cachedSnapshot = _cachedSnapshot;
+                    var freshState = session.GetClusterState();
+                    var cached = _cachedSnapshot;
 
-                    // Double-check: another thread may have updated the cache while we waited for lock.
-                    if (cachedSnapshot != null && cachedSnapshot.State.Equals(clusterState))
+                    // Double-check: another thread may have already updated the cache.
+                    if (cached != null && cached.State.Equals(freshState))
                     {
-                        clusterState.Dispose();
-                        return cachedSnapshot;
+                        freshState.Dispose();
+                        return ClusterSnapshot.CloneByRef(cached); // Clone for the caller.
                     }
 
-                    // If cluster state changed, and cache is stale, refresh it.
-                    var newSnapshot = RefreshTopologyCache(clusterState, cachedSnapshot?.Registry);
+                    var newSnapshot = ClusterSnapshot.BuildFromFreshState(
+                        freshState, cached?.Registry);
 
-                    Interlocked.Exchange(ref _cachedSnapshot, newSnapshot);
-                    // We cannot dispose the old snapshot here 
+                    var old = Interlocked.Exchange(ref _cachedSnapshot, newSnapshot);
+                    old?.Dispose(); // Release the cache's old refcount.
 
-                    return newSnapshot;
+                    return ClusterSnapshot.CloneByRef(newSnapshot); // Clone for the caller.
                 }
             }
             finally
             {
                 session.DecreaseReferenceCount();
             }
-        }
-
-        /// <summary>
-        /// Updates the cached topology if the cluster state has changed.
-        /// </summary>
-        private static ClusterSnapshot RefreshTopologyCache(BridgedClusterState clusterState, HostRegistry oldRegistry)
-        {
-            var context = new RefreshContext(oldRegistry?.HostsById ?? new Dictionary<Guid, Host>());
-            clusterState.FillHostCache(context);
-            return new ClusterSnapshot(clusterState, context.ToNewRegistry());
         }
 
         /// <summary>
@@ -232,7 +258,7 @@ namespace Cassandra
         {
             ArgumentNullException.ThrowIfNull(partitionKey);
 
-            var snapshot = GetSnapshot();
+            using var snapshot = GetSnapshot();
 
             // NOTE: C# Metadata.GetReplicas doesn't provide the table name.
             // For correctness, token computation should use the cluster/table partitioner; and for Scylla
@@ -272,7 +298,7 @@ namespace Cassandra
             }
             finally
             {
-                // Release the lock on the session created by calling _getActiveSessionOrThrow. 
+                // Release the lock on the session created by calling _getActiveSessionOrThrow.
                 session.DecreaseReferenceCount();
             }
         }
@@ -293,7 +319,7 @@ namespace Cassandra
             }
             finally
             {
-                // Release the lock on the session created by calling _getActiveSessionOrThrow. 
+                // Release the lock on the session created by calling _getActiveSessionOrThrow.
                 session.DecreaseReferenceCount();
             }
         }
@@ -317,7 +343,7 @@ namespace Cassandra
             }
             finally
             {
-                // Release the lock on the session created by calling _getActiveSessionOrThrow. 
+                // Release the lock on the session created by calling _getActiveSessionOrThrow.
                 session.DecreaseReferenceCount();
             }
         }
@@ -340,7 +366,7 @@ namespace Cassandra
             }
             finally
             {
-                // Release the lock on the session created by calling _getActiveSessionOrThrow. 
+                // Release the lock on the session created by calling _getActiveSessionOrThrow.
                 session.DecreaseReferenceCount();
             }
         }

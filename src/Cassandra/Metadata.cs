@@ -124,9 +124,20 @@ namespace Cassandra
             internal static ClusterSnapshot BuildFromFreshState(
                 BridgedClusterState state, HostRegistry oldRegistry)
             {
-                var context = new RefreshContext(
-                    oldRegistry?.HostsById ?? new Dictionary<Guid, Host>());
-                state.FillHostCache(context);
+                RefreshContext context;
+                try
+                {
+                    var hostsById = oldRegistry?.HostsById ?? new Dictionary<Guid, Host>();
+                    context = new(hostsById);
+                    state.FillHostCache(context);
+                }
+                catch (Exception)
+                {
+                    // If FillHostCache throws before ownership is transferred to the snapshot,
+                    // dispose eagerly here rather than relying on SafeHandle finalization.
+                    state.DecreaseReferenceCount();
+                    throw;
+                }
                 return new ClusterSnapshot(state, context.ToNewRegistry());
             }
 

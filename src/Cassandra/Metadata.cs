@@ -141,7 +141,7 @@ namespace Cassandra
                 return new ClusterSnapshot(state, context.ToNewRegistry());
             }
 
-            public void Dispose() => State.DecreaseReferenceCount();
+            public void Dispose() => State.Dispose();
         }
 
         private volatile ClusterSnapshot _cachedSnapshot = null;
